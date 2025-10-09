@@ -1,0 +1,306 @@
+import time
+import os
+import glob
+from datetime import date, timedelta
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+
+# =============================== 配置区 ==================================
+# !! 重要 !! 请务必将此路径修改为您自己电脑上 chromedriver.exe 的实际路径
+CHROMEDRIVER_PATH = r"C:\Users\User\Downloads\chromedriver-win64\chromedriver-win64\chromedriver.exe"
+
+LOGIN_URL = "https://newplatform.mygamem777.com/#/HouseholdRetentionRate"
+USERNAME = "touhout1"
+PASSWORD = "a1234567"
+
+# 下载文件存放的目录 (通常是系统的“下载”文件夹)
+DOWNLOADS_PATH = os.path.join(os.path.expanduser('~'), 'Downloads')
+
+# 通用“黑名单”，在遍历渠道时，这些渠道将被跳过，不予下载
+EXCLUDED_CHANNELS = ['12 | ORGANIC', '1111 | 测试', '1112 | 7STAR']
+
+# LTV 报表的分组规则定义
+# 格式： '用作文件名的组名': '渠道名称中包含的独特标识符'
+LTV_GROUPS = {
+    "投放组(111)": "_111_",
+    "KKK组(222)": "_222_",
+    "ZZZ组(333)": "_333_",
+}
+# ========================================================================
+
+def find_and_rename_newest_file(download_path, new_filename_base, file_date):
+    """查找最新下载的文件，并根据提供的基础名称和日期进行重命名。"""
+    print(f"      > 等待文件下载完成...")
+    # [修改] 根据您的要求，将等待时间缩短
+    time.sleep(3)
+    
+    # 查找下载目录中最新的 .csv 或 .xlsx 文件
+    list_of_files = glob.glob(os.path.join(download_path, '*.csv')) + glob.glob(os.path.join(download_path, '*.xlsx'))
+    if not list_of_files:
+        print(f"      [警告] 下载目录中未找到任何文件！")
+        return None
+        
+    latest_file = max(list_of_files, key=os.path.getctime)
+    
+    # 检查文件是否是刚刚创建的，防止错误重命名旧文件
+    if time.time() - os.path.getctime(latest_file) > 120: # 如果文件创建时间在2分钟前
+        print(f"      [警告] 未找到最近2分钟内下载的新文件，跳过重命名。")
+        return None
+
+    _, extension = os.path.splitext(latest_file)
+    new_filename = f"{new_filename_base}_{file_date.strftime('%Y-%m-%d')}{extension}"
+    new_filepath = os.path.join(download_path, new_filename)
+    
+    # 如果目标文件名已存在，先删除
+    if os.path.exists(new_filepath):
+        os.remove(new_filepath)
+        
+    os.rename(latest_file, new_filepath)
+    print(f"      [成功] 文件已重命名为: {new_filename}")
+    return new_filepath
+
+
+def perform_export_flow(driver, wait, download_path, filename_base, period, report_type="standard"):
+    """
+    一个通用的执行导出流程的函数。
+    period: "本月" 或 "上月" 或 日期对象(date)
+    """
+    try:
+        print(f"    -> 正在处理时间段: {period if isinstance(period, str) else period.strftime('%Y-%m-%d')}")
+        
+        # --- 1. 选择时间 (仅非每日渠道报表需要) ---
+        if report_type != "daily_channel":
+            if period in ["本月", "上月"]:
+                date_picker = wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "el-range-separator")))
+                date_picker.click()
+                wait.until(EC.visibility_of_element_located((By.XPATH, f"//button/span[text()='{period}']")))
+                driver.find_element(By.XPATH, f"//button/span[text()='{period}']").click()
+                time.sleep(1)
+
+        # --- 2. 查询 ---
+        print("      > 点击查询...")
+        # 每日渠道报表需要特殊处理日期输入
+        if report_type == "daily_channel":
+             date_input = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@placeholder='请选择日期']")))
+             date_input.click()
+             date_input.clear()
+             date_input.send_keys(period.strftime('%Y-%m-%d'))
+             driver.find_element(By.TAG_NAME, 'body').click()
+             time.sleep(1)
+
+        query_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[span[contains(text(),'查询')]]")))
+        query_button.click()
+        print("      > 等待数据加载...")
+        # [修改] 根据您的要求，将等待时间缩短
+        time.sleep(3)
+
+        # --- 3. 导出 ---
+        print("      > 点击导出...")
+        
+        # 根据报表类型决定导出按钮
+        if report_type == "daily_channel":
+             # 每日渠道报表需要根据filename_base来决定点哪个按钮
+             if "渠道质量" in filename_base:
+                 export_button_xpath = "//button[span[contains(text(),'导出渠道质量')]]"
+             elif "用户质量" in filename_base:
+                 export_button_xpath = "//button[span[contains(text(),'导出用户质量')]]"
+             else: # 经济效益
+                 export_button_xpath = "//button[span[contains(text(),'导出经济效益')]]"
+        else:
+             export_button_xpath = "//button[span[contains(text(),'导出本页数据')]]"
+
+        export_button = wait.until(EC.element_to_be_clickable((By.XPATH, export_button_xpath)))
+        driver.execute_script("arguments[0].click();", export_button)
+        
+        # --- 4. 在弹窗中确认导出 ---
+        print("      > 在弹窗中确认导出...")
+        popup_export_button_xpath = "//div[contains(@class, 'vxe-modal--wrapper')]//button[span[text()='导出']]"
+        popup_export_button = wait.until(EC.element_to_be_clickable((By.XPATH, popup_export_button_xpath)))
+        driver.execute_script("arguments[0].click();", popup_export_button)
+
+        # --- 5. 重命名文件 ---
+        file_date = date.today() if period in ["本月", "上月"] else period
+        find_and_rename_newest_file(download_path, filename_base, file_date)
+
+    except Exception as e:
+        print(f"    [错误] 在处理 '{filename_base}' 的 '{period}' 时间段时失败: {e}")
+        driver.refresh()
+        # [修改] 根据您的要求，将等待时间缩短
+        time.sleep(3)
+
+
+def get_all_channels(driver, wait):
+    """点击渠道下拉框并返回所有渠道名称的列表"""
+    print("    -> 正在获取所有渠道列表...")
+    try:
+        channel_dropdown_input = wait.until(EC.element_to_be_clickable((By.XPATH, "(//input[@class='el-select__input'])[1]")))
+        driver.execute_script("arguments[0].click();", channel_dropdown_input)
+        
+        dropdown_panel_xpath = "//body/div[contains(@class, 'el-select-dropdown') and not(contains(@style,'display: none'))]"
+        wait.until(EC.visibility_of_element_located((By.XPATH, dropdown_panel_xpath)))
+        
+        channel_elements = driver.find_elements(By.XPATH, f"{dropdown_panel_xpath}//ul/li")
+        channels = [elem.text for elem in channel_elements if elem.text]
+        
+        driver.find_element(By.TAG_NAME, 'body').click()
+        time.sleep(1)
+        print(f"    [成功] 共获取到 {len(channels)} 个渠道。")
+        return channels
+    except Exception as e:
+        print(f"    [严重错误] 获取渠道列表失败: {e}")
+        return []
+
+# --- 主程序 ---
+def main():
+    print("--- 全功能自动化下载脚本启动 (高速版) ---")
+    s = Service(CHROMEDRIVER_PATH)
+    chrome_options = Options()
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    driver = webdriver.Chrome(service=s, options=chrome_options)
+    wait = WebDriverWait(driver, 30)
+    driver.maximize_window()
+
+    try:
+        driver.get(LOGIN_URL)
+        print("页面加载中，等待登录...")
+        wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='账户']"))).send_keys(USERNAME)
+        driver.find_element(By.XPATH, "//input[@placeholder='密码']").send_keys(PASSWORD)
+        driver.find_element(By.XPATH, "//button[contains(., '登录')]").click()
+        
+        print("\n" + "="*50)
+        print("脚本已暂停！请手动完成可能的验证码验证。")
+        input("登录成功并看到主页后，请回到此窗口，按 Enter (回车) 键继续...")
+        print("="*50 + "\n脚本恢复，开始下载报表...\n")
+
+        reports = [
+            {"name": "运营统计", "type": "standard"},
+            {"name": "用户留存率(首充复登)", "type": "user_retention"},
+            {"name": "用户留存率(首充复充)", "type": "user_retention"},
+            {"name": "赠送类型统计", "type": "standard"},
+            {"name": "推广渠道统计", "type": "standard"},
+            {"name": "每日渠道统计", "type": "daily_channel"},
+            {"name": "LTV", "type": "ltv"},
+        ]
+
+        for report in reports:
+            print(f"\n--- 开始处理报表: {report['name']} ---")
+            try:
+                menu_item = wait.until(EC.element_to_be_clickable((By.XPATH, f"//li[normalize-space()='{report['name']}']")))
+                menu_item.click()
+                print(f"  > 已进入 '{report['name']}' 页面，等待加载...")
+                # [修改] 根据您的要求，将等待时间缩短
+                time.sleep(3)
+
+                if report['type'] == 'standard':
+                    perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}", "本月")
+                    perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}", "上月")
+
+                elif report['type'] == 'daily_channel':
+                    yesterday = date.today() - timedelta(days=1)
+                    perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_渠道质量", yesterday, report_type="daily_channel")
+                    perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_用户质量", yesterday, report_type="daily_channel")
+                    perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_经济效益", yesterday, report_type="daily_channel")
+
+                elif report['type'] == 'user_retention':
+                    print("  -> 阶段一: 下载全平台数据")
+                    perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_全平台", "本月")
+                    perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_全平台", "上月")
+
+                    print("\n  -> 阶段二: 遍历下载单个渠道数据")
+                    all_channels = get_all_channels(driver, wait)
+                    for channel in all_channels:
+                        if channel in EXCLUDED_CHANNELS or channel == "全平台":
+                            print(f"    - 跳过渠道: {channel}")
+                            continue
+                        
+                        print(f"    -> 正在处理渠道: {channel}")
+                        wait.until(EC.element_to_be_clickable((By.XPATH, "(//input[@class='el-select__input'])[1]"))).click()
+                        channel_option = wait.until(EC.element_to_be_clickable((By.XPATH, f"//body/div[contains(@class, 'el-select-dropdown')]//li[normalize-space()=\"{channel}\"]")))
+                        channel_option.click()
+                        time.sleep(1)
+
+                        safe_channel_name = "".join(c for c in channel if c.isalnum() or c in (' ', '_')).rstrip()
+                        perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_{safe_channel_name}", "本月")
+                        perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_{safe_channel_name}", "上月")
+                
+                elif report['type'] == 'ltv':
+                    print("  -> LTV报表处理开始...")
+                    all_channels = get_all_channels(driver, wait)
+                    processed_channels = set()
+
+                    print("\n  -> 阶段一: 按分组多选下载")
+                    for group_name, identifier in LTV_GROUPS.items():
+                        print(f"    -> 正在处理分组: {group_name}")
+                        channels_in_group = [ch for ch in all_channels if identifier in ch]
+                        
+                        if not channels_in_group:
+                            print(f"      - 未找到属于该组 '{group_name}' 的渠道，跳过。")
+                            continue
+
+                        multiselect_input = wait.until(EC.element_to_be_clickable((By.XPATH, "(//input[@class='el-select__input'])[1]")))
+                        multiselect_input.click()
+                        wait.until(EC.visibility_of_element_located((By.XPATH, "//body/div[contains(@class, 'el-select-dropdown')]")))
+
+                        for channel in channels_in_group:
+                            print(f"      > 勾选: {channel}")
+                            option = driver.find_element(By.XPATH, f"//body/div[contains(@class, 'el-select-dropdown')]//li[normalize-space()=\"{channel}\"]")
+                            option.click()
+                            processed_channels.add(channel)
+                        
+                        driver.find_element(By.TAG_NAME, 'body').click()
+                        time.sleep(2)
+
+                        safe_group_name = "".join(c for c in group_name if c.isalnum() or c in (' ', '_')).rstrip()
+                        perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_{safe_group_name}", "本月")
+                        perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_{safe_group_name}", "上月")
+
+                        # 清空选择，为下一个分组或单个渠道做准备
+                        print("      > 清空当前选择...")
+                        clear_icons = driver.find_elements(By.XPATH, "//i[contains(@class, 'el-tag__close')]")
+                        for icon in reversed(clear_icons):
+                            icon.click()
+                        time.sleep(1)
+
+                    print("\n  -> 阶段二: 下载未分组的单个渠道")
+                    for channel in all_channels:
+                        if channel in processed_channels or channel in EXCLUDED_CHANNELS or channel == "全平台":
+                            print(f"    - 跳过已处理或被排除的渠道: {channel}")
+                            continue
+
+                        print(f"    -> 正在处理单个渠道: {channel}")
+                        wait.until(EC.element_to_be_clickable((By.XPATH, "(//input[@class='el-select__input'])[1]"))).click()
+                        channel_option = wait.until(EC.element_to_be_clickable((By.XPATH, f"//body/div[contains(@class, 'el-select-dropdown')]//li[normalize-space()=\"{channel}\"]")))
+                        channel_option.click()
+                        time.sleep(1)
+
+                        safe_channel_name = "".join(c for c in channel if c.isalnum() or c in (' ', '_')).rstrip()
+                        perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_{safe_channel_name}", "本月")
+                        perform_export_flow(driver, wait, DOWNLOADS_PATH, f"download_{report['name']}_{safe_channel_name}", "上月")
+
+            except Exception as e:
+                print(f"  [严重错误] 处理报表 '{report['name']}' 时发生未知错误: {e}")
+                print("  > 尝试刷新页面并继续下一个任务...")
+                driver.refresh()
+                time.sleep(5)
+                continue
+
+        print("\n" + "="*50)
+        print("🎉 全部任务执行完毕！")
+        print("="*50)
+
+    except Exception as e:
+        print(f"\n脚本在执行过程中发生严重错误: {e}")
+    finally:
+        if 'driver' in locals() and driver:
+            driver.quit()
+        print("--- 脚本运行结束 ---")
+
+if __name__ == "__main__":
+    main()
