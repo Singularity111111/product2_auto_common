@@ -2,78 +2,58 @@ import os
 import glob
 import pandas as pd
 import openpyxl
+from openpyxl.utils import column_index_from_string
+from datetime import datetime
 import shutil
 
-# =============================== 配置区 ==================================
-# 您的原始模板 Excel 文件名
-SOURCE_EXCEL_NAME = '产品二-VNL日报-10月 (13).xlsx'
+# =============================== CONFIGURATION ==================================
+SOURCE_EXCEL_NAME = '需要覆盖的文件.xlsx'
+OUTPUT_EXCEL_NAME = SOURCE_EXCEL_NAME.replace('.xlsx', '_updated_final.xlsx')
 
-# 定义输出文件名
-OUTPUT_EXCEL_NAME = SOURCE_EXCEL_NAME.replace('.xlsx', '_updated_v7.xlsx')
-
-# 定义“源文件关键字”与“目标Sheet”、“日期列名”以及“起始列”的映射规则
-# 格式: '文件名关键字': ('Sheet名', '日期列名', 起始写入列)
-# ★★★ C列对应的是 3，A列对应的是 1 ★★★
 REPORT_MAP = {
-    # 主要数据表
-    '运营统计': ('后台', '时间', 3), 
-    '用户留存率(首充复登)_全平台': ('首充复登', '时间', 1),
-    '用户留存率(首充复充)_全平台': ('首充复充', '时间', 1),
-    'LTV全平台': ('LTV', '时间', 3), # <--- 关键修改：将LTV的起始列从 1 改为 3
-
-    # 推广渠道统计的三个文件，写入新Sheet时默认从第1列开始
-    '推广渠道统计-渠道质量': ('推广-渠道质量', '日期', 1),
-    '推广渠道统计-用户质量': ('推广-用户质量', '日期', 1),
-    '推广渠道统计-经济效益': ('推广-经济效益', '日期', 1),
-
-    # 其他单页报表
-    '赠送类型统计': ('赠送类型统计', '日期', 1),
-    '每日渠道统计': ('每日渠道统计', '日期', 1),
+    '运营统计': ('后台', '时间', 'C', 'update_or_append'),
+    'LTV全平台': ('LTV', '时间', 'C', 'update_or_append'),
+    '用户留存率(首充复登)_全平台': ('首充复登', '时间', 'I', 'update_and_sort'),
+    '用户留存率(首充复充)_全平台': ('首充复充', '时间', 'J', 'update_and_sort'),
+    '推广渠道统计-渠道质量': ('推广渠道统计', '日期', 'B', 'update_in_place'),
+    '推广渠道统计-用户质量': ('推广渠道统计', '日期', 'B', 'update_in_place'),
+    '推广渠道统计-经济效益': ('推广渠道统计', '日期', 'B', 'update_in_place'),
+    '赠送类型统计': ('赠送类型统计', '日期', 'A', 'append_all'),
+    '每日渠道统计': ('每日渠道统计', '日期', 'A', 'append_all'),
 }
 # ========================================================================
 
-def smart_update_excel_v7():
-    """
-    智能更新Excel V7 版：
-    - 修正了LTV Sheet的起始列，解决最终的错位问题。
-    - 继承之前版本所有功能。
-    """
+def to_datetime_obj(value):
+    if isinstance(value, datetime):
+        return value
+    if pd.isna(value) or value is None or str(value).strip() == '':
+        return None
+    try:
+        return pd.to_datetime(str(value))
+    except (ValueError, TypeError):
+        return None
+
+def run_update():
     current_directory = os.getcwd()
     source_path = os.path.join(current_directory, SOURCE_EXCEL_NAME)
     output_path = os.path.join(current_directory, OUTPUT_EXCEL_NAME)
 
-    print(f"--- 启动智能更新程序 (V7 - 最终完美对齐版) ---")
-
-    # 1. 检查并复制模板文件
-    if not os.path.exists(source_path):
-        print(f"\n[错误] 模板文件 '{SOURCE_EXCEL_NAME}' 不存在。")
-        return
+    print(f"--- Starting Smart Update ---")
     try:
         shutil.copy(source_path, output_path)
-        print(f"✓ 已创建安全副本: {OUTPUT_EXCEL_NAME}")
+        print(f"✓ Safe copy created: {OUTPUT_EXCEL_NAME}")
     except Exception as e:
-        print(f"\n[错误] 创建副本失败: {e}")
+        print(f"\n[ERROR] Failed to create a copy: {e}")
         return
 
-    # 2. 查找CSV文件
     csv_files = glob.glob(os.path.join(current_directory, '*.csv'))
-    if not csv_files:
-        print("\n[警告] 未找到任何CSV源文件。")
-        return
-    print(f"✓ 找到 {len(csv_files)} 个CSV文件准备处理...")
+    print(f"✓ Found {len(csv_files)} CSV files to process...")
 
-    # 3. 加载工作簿
-    try:
-        workbook = openpyxl.load_workbook(output_path)
-    except Exception as e:
-        print(f"\n[错误] 打开Excel副本失败: {e}")
-        return
+    workbook = openpyxl.load_workbook(output_path)
 
-    # 4. 核心处理逻辑
     for csv_path in csv_files:
         filename = os.path.basename(csv_path)
         mapping = None
-
         for keyword, value in sorted(REPORT_MAP.items(), key=lambda item: len(item[0]), reverse=True):
             if keyword in filename:
                 mapping = value
@@ -82,97 +62,159 @@ def smart_update_excel_v7():
         if not mapping:
             continue
 
-        sheet_name, date_col_name, start_col = mapping
-        print(f"\n+ [处理中] '{filename}' -> Sheet: '{sheet_name}' (从第 {start_col} 列开始)")
+        sheet_name, date_col_name_csv, date_col_letter_excel, strategy = mapping
+        date_col_idx_excel = column_index_from_string(date_col_letter_excel)
+        print(f"\n+ Processing '{filename}' -> Sheet: '{sheet_name}' (Strategy: {strategy})")
 
         try:
-            # 读取CSV
-            try:
-                source_df = pd.read_csv(csv_path, dtype=str).fillna('')
-            except UnicodeDecodeError:
-                source_df = pd.read_csv(csv_path, dtype=str, encoding='gbk').fillna('')
+            source_df = pd.read_csv(csv_path, keep_default_na=False, dtype=str)
             if source_df.empty:
-                print("  - [信息] CSV文件为空，跳过。")
+                print("  - INFO: CSV file is empty, skipping.")
+                continue
+            
+            source_df = source_df[~source_df[date_col_name_csv].astype(str).str.contains("数据汇总")]
+            source_df = source_df[source_df[date_col_name_csv].astype(str).str.strip() != '']
+            if source_df.empty:
+                print("  - INFO: CSV has no valid data rows after cleaning, skipping.")
                 continue
 
-            # 获取或创建Sheet
             sheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.create_sheet(title=sheet_name)
 
-            # 定位日期列在Excel中的实际列号
-            date_col_index_in_excel = -1
-            target_data = list(sheet.values)
-            target_df_for_header = pd.DataFrame(target_data)
-            for i in range(min(5, len(target_df_for_header))): 
-                row_values = [str(c).strip() if c is not None else '' for c in target_df_for_header.iloc[i]]
-                if date_col_name in row_values:
-                    date_col_index_in_excel = row_values.index(date_col_name)
-                    break
-            
-            # 定位日期列在CSV中的列号
-            date_col_index_in_csv = 0
-            # HACK: Handle potential duplicate columns in CSV by taking the first one
-            if isinstance(source_df.columns, pd.MultiIndex):
-                csv_cols = source_df.columns.get_level_values(0).tolist()
-            else:
-                csv_cols = source_df.columns.tolist()
-            if date_col_name in csv_cols:
-                date_col_index_in_csv = csv_cols.index(date_col_name)
+            if strategy == 'update_or_append':
+                date_to_row_map = {}
+                for row_idx in range(1, sheet.max_row + 1):
+                    cell_value = sheet.cell(row=row_idx, column=date_col_idx_excel).value
+                    date_obj = to_datetime_obj(cell_value)
+                    if date_obj:
+                        date_to_row_map[date_obj.strftime('%Y-%m-%d')] = row_idx
 
-            # 建立日期 -> 行号的映射
-            date_to_row_map = {}
-            if date_col_index_in_excel != -1:
-                date_to_row_map = {
-                    str(row[date_col_index_in_excel]).strip(): (idx + 1)
-                    for idx, row in enumerate(sheet.iter_rows(values_only=True))
-                    if len(row) > date_col_index_in_excel and row[date_col_index_in_excel] is not None and str(row[date_col_index_in_excel]).strip()
-                }
+                rows_to_append_df, updated_count = [], 0
+                for index, source_row in source_df.iterrows():
+                    csv_date_obj = to_datetime_obj(source_row[date_col_name_csv])
+                    if not csv_date_obj: continue
+                    csv_date_key = csv_date_obj.strftime('%Y-%m-%d')
+                    
+                    if csv_date_key in date_to_row_map:
+                        target_row_num = date_to_row_map[csv_date_key]
+                        for col_offset, value in enumerate(source_row.values):
+                            sheet.cell(row=target_row_num, column=date_col_idx_excel + col_offset, value=value)
+                        updated_count += 1
+                    else:
+                        rows_to_append_df.append(source_row)
+                
+                if rows_to_append_df:
+                    for row_to_append in pd.DataFrame(rows_to_append_df).itertuples(index=False):
+                        sheet.append([None] * (date_col_idx_excel - 1) + list(row_to_append))
+                print(f"  ✓ Done: Updated {updated_count} rows and appended {len(rows_to_append_df)} new rows.")
 
-            updates_count = 0
-            appends_count = 0
-
-            # 遍历源数据
-            for index, source_row in source_df.iterrows():
-                date_val = str(source_row.iloc[date_col_index_in_csv]).strip()
-
-                if "数据汇总" in date_val:
+            # =================== FINAL 'update_and_sort' LOGIC ===================
+            elif strategy == 'update_and_sort':
+                header_row_index = -1
+                for i in range(1, min(21, sheet.max_row + 1)):
+                    row_values = [str(c.value) for c in sheet[i]]
+                    if date_col_name_csv in row_values:
+                        header_row_index = i
+                        break
+                
+                if header_row_index == -1:
+                    print(f"  - ERROR: Could not find header row with '{date_col_name_csv}'. Skipping.")
                     continue
 
-                # 更新现有行
-                if date_val in date_to_row_map:
-                    row_num = date_to_row_map[date_val]
-                    is_different = False
-                    for col_idx, value in enumerate(source_row):
-                        target_cell = sheet.cell(row=row_num, column=col_idx + start_col)
-                        source_val = str(value).strip()
-                        target_val = str(target_cell.value if target_cell.value is not None else '').strip()
-                        if source_val != target_val:
-                            target_cell.value = value
-                            is_different = True
-                    if is_different:
-                        updates_count += 1
-                # 追加新行
-                else:
-                    new_row_num = sheet.max_row + 1 if sheet.max_row > 0 else 1
-                    # A special check for completely empty sheets
-                    if sheet.max_row == 1 and all(c.value is None for c in sheet[1]):
-                        new_row_num = 1
-                    for col_idx, value in enumerate(source_row.to_list()):
-                        sheet.cell(row=new_row_num, column=col_idx + start_col, value=value)
-                    appends_count += 1
+                # ** THE FIX: Correctly identify the start of data after multi-line headers **
+                data_start_row = header_row_index + 2
+
+                excel_data_rows = []
+                num_excel_cols = len(source_df.columns)
+                for row in sheet.iter_rows(min_row=data_start_row, values_only=True):
+                    if len(row) >= date_col_idx_excel and row[date_col_idx_excel - 1] is not None:
+                        # Slice the row to match the number of columns in the CSV
+                        row_slice = list(row[date_col_idx_excel - 1 : date_col_idx_excel - 1 + num_excel_cols])
+                        excel_data_rows.append(row_slice)
+
+                excel_df = pd.DataFrame(excel_data_rows, columns=source_df.columns)
+
+                excel_df.dropna(subset=[date_col_name_csv], inplace=True)
+                source_df.dropna(subset=[date_col_name_csv], inplace=True)
+
+                excel_df[date_col_name_csv] = excel_df[date_col_name_csv].apply(to_datetime_obj)
+                source_df[date_col_name_csv] = source_df[date_col_name_csv].apply(to_datetime_obj)
+
+                combined_df = pd.concat([excel_df, source_df], ignore_index=True)
+                combined_df.drop_duplicates(subset=[date_col_name_csv], keep='last', inplace=True)
+                combined_df.sort_values(by=date_col_name_csv, inplace=True)
+
+                # ** THE FIX: Use safer "overwrite-and-clear" method instead of deleting rows **
+                num_new_rows = len(combined_df)
+                max_existing_data_row = sheet.max_row
+                
+                # Overwrite data row by row
+                for i, data_row in enumerate(combined_df.itertuples(index=False)):
+                    target_excel_row = data_start_row + i
+                    # Write data starting from the correct date column
+                    for j, value in enumerate(data_row):
+                        # Convert datetime back to string for consistent format if needed
+                        if isinstance(value, pd.Timestamp):
+                            value = value.strftime('%Y-%m-%d %H:%M:%S')
+                        sheet.cell(row=target_excel_row, column=date_col_idx_excel + j, value=value)
+                
+                # Clear any leftover old rows if the new data is shorter
+                last_new_row_index = data_start_row + num_new_rows -1
+                if max_existing_data_row > last_new_row_index:
+                    for row_to_clear in range(last_new_row_index + 1, max_existing_data_row + 1):
+                        for col_to_clear in range(date_col_idx_excel, date_col_idx_excel + num_excel_cols):
+                            sheet.cell(row=row_to_clear, column=col_to_clear, value=None)
+
+                print(f"  ✓ Done: Safely rebuilt and sorted data. Final sheet has {num_new_rows} data rows.")
+
+            elif strategy == 'update_in_place':
+                excel_headers_map = {}
+                for r_idx in range(1, min(51, sheet.max_row + 1)):
+                    for c_idx in range(1, min(51, sheet.max_column + 1)):
+                        cell = sheet.cell(row=r_idx, column=c_idx)
+                        if cell.value is not None:
+                            excel_headers_map[str(cell.value).strip()] = (r_idx, c_idx)
+
+                updated_count, not_found_dates = 0, []
+                for index, source_row in source_df.iterrows():
+                    source_date_obj = to_datetime_obj(source_row[date_col_name_csv])
+                    if not source_date_obj: continue
+                    source_date_key = source_date_obj.strftime('%Y-%m-%d')
+                    
+                    target_row_num = -1
+                    for r_idx in range(1, sheet.max_row + 1):
+                        cell_value = sheet.cell(row=r_idx, column=date_col_idx_excel).value
+                        cell_date_obj = to_datetime_obj(cell_value)
+                        if cell_date_obj and cell_date_obj.strftime('%Y-%m-%d') == source_date_key:
+                            target_row_num = r_idx
+                            break
+                    
+                    if target_row_num != -1:
+                        for col_name, value in source_row.items():
+                            if col_name in excel_headers_map:
+                                _, target_col_idx = excel_headers_map[col_name]
+                                sheet.cell(row=target_row_num, column=target_col_idx, value=value)
+                        updated_count += 1
+                    else:
+                        not_found_dates.append(source_date_key)
+                
+                print(f"  ✓ Done: Updated data for {updated_count} dates.")
+                if not_found_dates:
+                    print(f"  - WARNING: Could not find rows for dates: {', '.join(sorted(not_found_dates))}")
             
-            print(f"  ✓ 处理完成：更新了 {updates_count} 行，追加了 {appends_count} 行。")
+            elif strategy == 'append_all':
+                for row_data in source_df.values.tolist():
+                    sheet.append([None] * (date_col_idx_excel - 1) + row_data)
+                print(f"  ✓ Done: Appended {len(source_df)} rows.")
 
         except Exception as e:
-            print(f"  > [失败] 处理此文件时发生严重错误: {e}")
+            import traceback
+            print(f"  > [FAILED] An unexpected error occurred: {e}")
+            print(traceback.format_exc())
 
-    # 5. 保存
-    try:
-        workbook.save(output_path)
-        print("\n" + "="*50)
-        print(f"🎉 智能更新完毕！已生成新文件: {OUTPUT_EXCEL_NAME}")
-        print("="*50)
-    except Exception as e:
-        print(f"\n[严重错误] 保存Excel文件失败: {e}")
+    workbook.save(output_path)
+    print("\n" + "="*50)
+    print(f"🎉 All tasks complete! New file created: {OUTPUT_EXCEL_NAME}")
+    print("="*50)
 
 if __name__ == '__main__':
-    smart_update_excel_v7()
+    run_update()
