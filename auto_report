@@ -1,1228 +1,167 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-自动化报表下载脚本 - 最终完美版
-基于鼠标操作的日期选择器实现
-"""
-
-import time
 import os
 import glob
-import logging
-import uuid
-import random
+import pandas as pd
+import openpyxl
+from openpyxl.utils.dataframe import dataframe_to_rows
 import shutil
-from datetime import date, timedelta
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, NoSuchElementException
+from datetime import datetime
 
 # =============================== 配置区 ==================================
-# !! 重要 !! 请务必将此路径修改为您自己电脑上 chromedriver.exe 的实际路径
-CHROMEDRIVER_PATH = r"C:\Users\User\Downloads\chromedriver-win64\chromedriver-win64\chromedriver.exe"
+SOURCE_EXCEL_NAME = '产品二-VNL日报-10月 (13).xlsx'
+OUTPUT_EXCEL_NAME = SOURCE_EXCEL_NAME.replace('.xlsx', '_updated_v10.xlsx')
 
-# 登录页面URL
-LOGIN_URL = "https://newplatform.mygamem777.com/#/HouseholdRetentionRate"
-
-# 下载路径配置
-DOWNLOADS_PATH = os.path.join(os.path.expanduser('~'), 'Downloads')
-
-# 全局黑名单渠道 - 这些渠道在所有报表中都会被跳过
-EXCLUDED_CHANNELS = ['12 | ORGANIC', '1111 | 测试', '1112 | 7STAR']
-
-# 完整的渠道列表 - 用于用户留存率和LTV报表
-COMPLETE_CHANNEL_LIST = [
-    '全平台',
-    '2 | M7_111_KKK_AAA_BQ01投放',
-    '1109 | M7_222_KKK_AAA_YINGBANG',
-    '1110 | M7_333_ZZZ_AAA_AF168',
-    '1113 | M7_111_KKK_BBB_77投放',
-    '1114 | M7_222_KKK_AAA_小于',
-    '1115 | M7_111_KKK_CCC_BQ01投放',
-    '1116 | T9短信',
-    '1118 | M7_222_KKK_AAA_大熊',
-    '1119 | M7_222_KKK_AAA_小虎',
-    '1120 | M7_222_KKK_AAA_鎏金',
-    '1121 | M7_222_KKK_AAA_大隆',
-    '1122 | M7_222_KKK_AAA_莉莉',
-    '1123 | M7_222_KKK_AAA_小六',
-    '1124 | M7_222_KKK_AAA_阿宝',
-    '1125 | M7_222_KKK_AAA_jan',
-    '1126 | M7_222_KKK_AAA_黑桃',
-    '1127 | M7_222_KKK_AAA_豆豆',
-    '1128 | M7_222_KKK_AAA_大元',
-    '1129 | M7_222_KKK_AAA_HT',
-    '1130 | M7_222_KKK_AAA_行远',
-    '1131 | M7_222_KKK_AAA_辉煌',
-    '1132 | M7_222_KKK_AAA_非凡',
-    '1133 | M7_222_KKK_AAA_U9',
-    '1134 | M7_111_KKK_CCC_A8马甲包',
-    '1135 | M7_111_KKK_AAA_78南宁',
-    '1136 | M7_111_KKK_CCC_IOS',
-    '1137 | M7_333_ZZZ_AAA_A8短信',
-    '1138 | M7_666_KKK_AAA_社媒',
-    '1139 | M7_333_ZZZ_AAA_500上',
-    '1140 | M7_333_ZZZ_AAA_注册',
-    '1141 | M7_333_ZZZ_AAA_召回',
-    '1142 | M7_111_KKK_AAA_强盛（壹哥）',
-    '1143 | M7_222_KKK_AAA_鱼一',
-    '1144 | M7_111_KKK_AAA_XG投放'
-]
-
-# LTV分组规则 - 用于LTV报表的渠道分组多选
-LTV_GROUPS = {
-    "投放组(111)": "_111_",
-    "KKK组(222)": "_222_", 
-    "ZZZ组(333)": "_333_",
+REPORT_MAP = {
+    '运营统计': ('后台', '时间', 3), 
+    '用户留存率(首充复登)_全平台': ('首充复登', '时间', 1),
+    '用户留存率(首充复充)_全平台': ('首充复充', '时间', 1),
+    'LTV全平台': ('LTV', '时间', 3), 
+    '推广渠道统计-渠道质量': ('推广-渠道质量', '日期', 1),
+    '推广渠道统计-用户质量': ('推广-用户质量', '日期', 1),
+    '推广渠道统计-经济效益': ('推广-经济效益', '日期', 1),
+    '赠送类型统计': ('赠送类型统计', '日期', 1),
+    '每日渠道统计': ('每日渠道统计', '日期', 1),
 }
-
-# 日志配置
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('auto_report.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# 设置控制台编码
-import sys
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
-if hasattr(sys.stderr, 'reconfigure'):
-    sys.stderr.reconfigure(encoding='utf-8')
-
 # ========================================================================
 
-def click_date_picker_with_mouse(driver, wait, period="本月"):
-    """使用鼠标点击操作日期选择器"""
-    print(f"      > Step 12: Looking for date picker input box...")
-    
+def to_standard_date(series):
+    """将一个Pandas Series转换为标准日期格式，并处理无效日期"""
+    return pd.to_datetime(series, errors='coerce').dt.strftime('%Y-%m-%d')
+
+def smart_update_excel_v10():
+    """
+    智能更新Excel V10 版：
+    - 核心重构：使用Pandas进行核心的数据比对与合并，彻底解决因数据类型不匹配导致的覆盖失败。
+    """
+    current_directory = os.getcwd()
+    source_path = os.path.join(current_directory, SOURCE_EXCEL_NAME)
+    output_path = os.path.join(current_directory, OUTPUT_EXCEL_NAME)
+
+    print(f"--- 启动智能更新程序 (V10 - 最终版) ---")
+
     try:
-        # 等待页面加载
-        time.sleep(2)
-        
-        # 尝试找到日期选择器输入框
-        date_input_selectors = [
-            "//div[contains(@class, 'date-picker')]//div[contains(@class, 'el-date-editor')]",
-            "//div[contains(@class, 'el-date-editor')]",
-            "//input[contains(@placeholder, '日期')]",
-            "//div[contains(@class, 'el-date-picker')]//input",
-            "//div[contains(@class, 'date-picker')]//input"
-        ]
-        
-        date_input = None
-        for i, selector in enumerate(date_input_selectors):
-            try:
-                elements = driver.find_elements(By.XPATH, selector)
-                for elem in elements:
-                    if elem.is_displayed():
-                        date_input = elem
-                        print(f"      > Found date input with selector {i+1}")
-                        break
-                if date_input:
-                    break
-            except:
-                continue
-        
-        if not date_input:
-            print("      > ERROR: Could not find date input")
-            return False
-        
-        # 使用ActionChains点击日期输入框
-        actions = ActionChains(driver)
-        actions.move_to_element(date_input).click().perform()
-        print("      > Step 13: Waiting for date picker panel to appear...")
-        
-        # 等待弹窗出现
-        time.sleep(2)
-        
-        # 根据period参数选择对应的按钮
-        button_text_variations = {
-            "本月": ["本月", "This Month", "Current Month", "当月", "本月数据"],
-            "上月": ["上月", "Last Month", "Previous Month", "上月数据"]
-        }
-        
-        target_texts = button_text_variations.get(period, [period])
-        
-        period_button = None
-        for text_variant in target_texts:
-            # 尝试多种选择器
-            period_button_selectors = [
-                f"//button[contains(text(), '{text_variant}')]",
-                f"//span[contains(text(), '{text_variant}')]",
-                f"//div[contains(text(), '{text_variant}')]",
-                f"//*[contains(text(), '{text_variant}')]"
-            ]
-            
-            for i, selector in enumerate(period_button_selectors):
-                try:
-                    elements = driver.find_elements(By.XPATH, selector)
-                    for elem in elements:
-                        if elem.is_displayed():
-                            period_button = elem
-                            print(f"      > Found {period} button with text '{text_variant}' using selector {i+1}")
-                            break
-                    if period_button:
-                        break
-                except:
-                    continue
-            
-            if period_button:
+        shutil.copy(source_path, output_path)
+        print(f"✓ 已创建安全副本: {OUTPUT_EXCEL_NAME}")
+    except Exception as e:
+        print(f"\n[错误] 创建副本失败: {e}")
+        return
+
+    csv_files = glob.glob(os.path.join(current_directory, '*.csv'))
+    print(f"✓ 找到 {len(csv_files)} 个CSV文件准备处理...")
+
+    try:
+        workbook = openpyxl.load_workbook(output_path)
+    except Exception as e:
+        print(f"\n[错误] 打开Excel副本失败: {e}")
+        return
+
+    for csv_path in csv_files:
+        filename = os.path.basename(csv_path)
+        mapping = None
+        for keyword, value in sorted(REPORT_MAP.items(), key=lambda item: len(item[0]), reverse=True):
+            if keyword in filename:
+                mapping = value
                 break
-        
-        if period_button:
-            # 使用ActionChains点击对应的按钮
-            actions = ActionChains(driver)
-            actions.move_to_element(period_button).click().perform()
-            print(f"      > Step 14: Clicked '{period}' button")
-            print(f"      > Step 15: Waiting for date picker panel to disappear...")
-            time.sleep(1)
-            return True
-        else:
-            print(f"      > ERROR: Could not find '{period}' button")
-            return False
-            
-    except Exception as e:
-        print(f"      > ERROR: Mouse click operation failed: {e}")
-        return False
+        if not mapping:
+            continue
 
-def find_and_rename_newest_file(download_path, new_filename_base, file_date, period_suffix=""):
-    """Find the newest downloaded file and rename it."""
-    logger.info(f"Waiting for file download to complete...")
-    print(f"      > Waiting for file download to complete...")
-    time.sleep(3)
-    
-    # Find all CSV files in download directory
-    csv_files = glob.glob(os.path.join(download_path, "*.csv"))
-    
-    if not csv_files:
-        logger.error("No CSV files found in download directory")
-        print(f"      > ERROR: No CSV files found in download directory")
-        return False
-    
-    # Find the newest file
-    newest_file = max(csv_files, key=os.path.getctime)
-    file_age = time.time() - os.path.getctime(newest_file)
-    
-    logger.info(f"Found {len(csv_files)} files in download directory")
-    print(f"      > Found {len(csv_files)} files in download directory")
-    print(f"      > Latest file: {os.path.basename(newest_file)}")
-    print(f"      > File age: {file_age:.1f} seconds")
-    
-    # Generate new filename with period suffix
-    if period_suffix:
-        new_filename = f"{new_filename_base}_{period_suffix}_{file_date.strftime('%Y-%m-%d')}.csv"
-    else:
-        new_filename = f"{new_filename_base}_{file_date.strftime('%Y-%m-%d')}.csv"
-    new_filepath = os.path.join(download_path, new_filename)
-    
-    print(f"      > New filename: {new_filename}")
-    
-    # Delete existing file if it exists
-    if os.path.exists(new_filepath):
-        os.remove(new_filepath)
-        logger.info(f"Deleted existing file: {new_filename}")
-        print(f"      > Deleted existing file: {new_filename}")
-    
-    # Rename the file
-    try:
-        os.rename(newest_file, new_filepath)
-        logger.info(f"File renamed to: {new_filename}")
-        print(f"      > SUCCESS: File renamed to: {new_filename}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to rename file: {e}")
-        print(f"      > ERROR: Failed to rename file: {e}")
-        return False
+        sheet_name, date_col_name, start_col = mapping
+        print(f"\n+ [处理中] '{filename}' -> Sheet: '{sheet_name}'")
 
-def execute_export_flow(driver, wait, report_type, period):
-    """A general function for executing export flow. Strictly implemented according to inspection element requirements."""
-    try:
-        logger.info(f"Starting to process time period: {period if isinstance(period, str) else period.strftime('%Y-%m-%d')}")
-        print(f"    -> Processing time period: {period if isinstance(period, str) else period.strftime('%Y-%m-%d')}")
-
-        # Handle date selection (only for non-daily channel statistics reports)
-        if report_type != "daily_channel":
-            if period in ["本月", "上月"]:
-                logger.info(f"Starting date selection process: {period}")
-                
-                # 使用鼠标点击操作日期选择器
-                success = click_date_picker_with_mouse(driver, wait, period)
-                
-                if success:
-                    logger.info(f"Date picker operation completed successfully")
-                    print(f"      > SUCCESS: Date picker operation completed")
-                else:
-                    logger.error(f"Date picker operation failed")
-                    print(f"      > ERROR: Date picker operation failed")
-                    return False
-
-        # Handle special date input for daily channel statistics
-        if report_type == "daily_channel":
-            logger.info("Handling daily channel statistics date input")
-            print("      > Handling daily channel statistics date input...")
-            try:
-                date_input = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@placeholder='请选择日期']")))
-                date_input.click()
-                date_input.clear()
-                date_input.send_keys(period.strftime('%Y-%m-%d'))
-                logger.info(f"Set date to: {period.strftime('%Y-%m-%d')}")
-                print(f"      > Set date to: {period.strftime('%Y-%m-%d')}")
-            except Exception as e:
-                logger.error(f"Failed to set date: {e}")
-                print(f"      > ERROR: Failed to set date: {e}")
-                return False
-
-        # Step 16: Click query button
-        print("      > Step 16: Looking for query button...")
         try:
-            query_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[span[contains(text(),'查询')]]")))
-            driver.execute_script("arguments[0].click();", query_button)
-            logger.info("Clicked query button")
-            print("      > Query button clicked successfully")
-        except Exception as e:
-            logger.error(f"Failed to click query button: {e}")
-            print(f"      > ERROR: Failed to click query button: {e}")
-            return False
-
-        # Step 17: Wait for loading to complete
-        print("      > Step 17: Waiting for loading to complete...")
-        try:
-            wait.until(EC.invisibility_of_element_located((By.CLASS_NAME, 'vxe-loading')))
-            logger.info("Data loading completed")
-            print("      > Data loading completed successfully")
-        except Exception as e:
-            logger.error(f"Data loading timeout: {e}")
-            print(f"      > WARNING: Data loading timeout: {e}")
-
-        # Step 18: Click export button
-        print("      > Step 18: Looking for export button...")
-        try:
-            export_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[span[contains(text(),'导出本页数据')]]")))
-            driver.execute_script("arguments[0].click();", export_button)
-            logger.info("Clicked export button")
-            print("      > Export button clicked successfully")
-        except Exception as e:
-            logger.error(f"Failed to click export button: {e}")
-            print(f"      > ERROR: Failed to click export button: {e}")
-            return False
-
-        # Step 19: Wait for confirmation dialog
-        print("      > Step 19: Waiting for confirmation dialog...")
-        try:
-            wait.until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'vxe-modal--wrapper')]")))
-            logger.info("Confirmation dialog appeared")
-            print("      > Confirmation dialog appeared")
-        except Exception as e:
-            logger.error(f"Confirmation dialog wait failed: {e}")
-            print(f"      > ERROR: Confirmation dialog wait failed: {e}")
-            return False
-
-        # Step 20: Click confirm export button
-        print("      > Step 20: Looking for confirm export button...")
-        try:
-            confirm_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//div[contains(@class, 'vxe-modal--wrapper')]//button[span[text()='导出']]")))
-            driver.execute_script("arguments[0].click();", confirm_button)
-            logger.info("Export confirmed")
-            print("      > Export confirmed successfully")
-        except Exception as e:
-            logger.error(f"Failed to confirm export: {e}")
-            print(f"      > ERROR: Failed to confirm export: {e}")
-            return False
-
-        # Step 21: Rename downloaded file
-        print("      > Step 21: Renaming downloaded file...")
-        file_date = date.today()
-        
-        # Determine period suffix for filename
-        period_suffix = ""
-        if isinstance(period, str) and period in ["本月", "上月"]:
-            period_suffix = period
-        
-        success = find_and_rename_newest_file(DOWNLOADS_PATH, f"download_{report_type}", file_date, period_suffix)
-        
-        if success:
-            logger.info("Export process completed successfully")
-            print("      > Export process completed successfully!")
-            return True
-        else:
-            logger.error("Export process failed")
-            print("      > ERROR: Export process failed")
-            return False
-
-    except Exception as e:
-        logger.error(f"Unknown error occurred while processing report '{report_type}': {e}")
-        print(f"      > [Critical Error] Unknown error occurred while processing report '{report_type}': {e}")
-        return False
-
-def process_standard_report(driver, wait, report_name):
-    """Process standard reports (运营统计, etc.)"""
-    logger.info(f"Starting to process standard report: {report_name}")
-    print(f"  Standard Report - Download current month and last month data")
-    
-    # Step 7: Click left menu item
-    print(f"  Step 7: Looking for '{report_name}' menu item...")
-    try:
-        menu_item = wait.until(EC.element_to_be_clickable((By.XPATH, f"//li[normalize-space()='{report_name}']")))
-        driver.execute_script("arguments[0].click();", menu_item)
-        logger.info(f"Clicked menu item: {report_name}")
-        print(f"  Step 8: Entered '{report_name}' page, waiting for page to load...")
-    except Exception as e:
-        logger.error(f"Failed to click menu item {report_name}: {e}")
-        print(f"  ERROR: Failed to click menu item {report_name}: {e}")
-        return False
-    
-    # Step 9: Wait for page loading
-    print("  Step 9: Waiting for page loading to complete...")
-    try:
-        wait.until(EC.invisibility_of_element_located((By.CLASS_NAME, 'vxe-loading')))
-        logger.info("Page loading completed")
-        print("  Step 10: Page loading completed, elements are interactive.")
-    except Exception as e:
-        logger.error(f"Page loading timeout: {e}")
-        print(f"  WARNING: Page loading timeout: {e}")
-    
-    periods = ["本月", "上月"]
-    
-    for period in periods:
-        print(f"    -> Step 11: Starting to download '{period}' data...")
-        success = execute_export_flow(driver, wait, report_name, period)
-        if not success:
-            logger.error(f"Failed to process period {period} for report {report_name}")
-            print(f"      > ERROR: Failed to process period {period}")
-            return False
-    
-    print(f"  Step 24: {report_name} report processing completed.")
-    return True
-
-def process_promotion_channel_report(driver, wait, report_name):
-    """Process promotion channel statistics report with three export buttons"""
-    logger.info(f"Starting to process promotion channel report: {report_name}")
-    print(f"  Promotion Channel Report - Download current month and last month data")
-    
-    # Step 7: Click left menu item
-    print(f"  Step 7: Looking for '{report_name}' menu item...")
-    try:
-        menu_item = wait.until(EC.element_to_be_clickable((By.XPATH, f"//li[normalize-space()='{report_name}']")))
-        driver.execute_script("arguments[0].click();", menu_item)
-        logger.info(f"Clicked menu item: {report_name}")
-        print(f"  Step 8: Entered '{report_name}' page, waiting for page to load...")
-    except Exception as e:
-        logger.error(f"Failed to click menu item {report_name}: {e}")
-        print(f"  ERROR: Failed to click menu item {report_name}: {e}")
-        return False
-    
-    # Step 9: Wait for page loading
-    print("  Step 9: Waiting for page loading to complete...")
-    try:
-        wait.until(EC.invisibility_of_element_located((By.CLASS_NAME, 'vxe-loading')))
-        logger.info("Page loading completed")
-        print("  Step 10: Page loading completed, elements are interactive.")
-    except Exception as e:
-        logger.error(f"Page loading timeout: {e}")
-        print(f"  WARNING: Page loading timeout: {e}")
-    
-    periods = ["本月", "上月"]
-    
-    for period in periods:
-        print(f"    -> Step 11: Starting to download '{period}' data...")
-        
-        # Execute date selection and query
-        success = execute_export_flow_for_promotion(driver, wait, report_name, period)
-        if not success:
-            logger.error(f"Failed to process period {period} for report {report_name}")
-            print(f"      > ERROR: Failed to process period {period}")
-            return False
-    
-    print(f"  Step 24: {report_name} report processing completed.")
-    return True
-
-def execute_export_flow_for_promotion(driver, wait, report_type, period):
-    """Execute export flow for promotion channel statistics with three export buttons"""
-    try:
-        logger.info(f"Starting to process time period: {period}")
-        print(f"    -> Processing time period: {period}")
-
-        # Handle date selection using mouse click
-        logger.info(f"Starting date selection process: {period}")
-        print(f"      > Step 12: Looking for date picker input box...")
-        
-        success = click_date_picker_with_mouse(driver, wait, period)
-        
-        if success:
-            logger.info(f"Date picker operation completed successfully")
-            print(f"      > SUCCESS: Date picker operation completed")
-        else:
-            logger.error(f"Date picker operation failed")
-            print(f"      > ERROR: Date picker operation failed")
-            return False
-
-        # Step 16: Click query button using mouse
-        print("      > Step 16: Looking for query button...")
-        try:
-            query_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[span[contains(text(),'查询')]]")))
-            # Use ActionChains for mouse click
-            actions = ActionChains(driver)
-            actions.move_to_element(query_button).click().perform()
-            logger.info("Clicked query button with mouse")
-            print("      > Query button clicked successfully with mouse")
-        except Exception as e:
-            logger.error(f"Failed to click query button: {e}")
-            print(f"      > ERROR: Failed to click query button: {e}")
-            return False
-
-        # Step 17: Wait for loading to complete
-        print("      > Step 17: Waiting for loading to complete...")
-        try:
-            wait.until(EC.invisibility_of_element_located((By.CLASS_NAME, 'vxe-loading')))
-            logger.info("Loading completed")
-            print("      > Loading completed, elements are interactive")
-        except Exception as e:
-            logger.error(f"Loading wait failed: {e}")
-            print(f"      > ERROR: Loading wait failed: {e}")
-            return False
-
-        # Export buttons for promotion channel statistics
-        export_buttons = [
-            ("导出渠道质量", "channel_quality"),
-            ("导出用户质量", "user_quality"),
-            ("导出经济效益", "economic_benefit")
-        ]
-        
-        for i, (button_text, file_suffix) in enumerate(export_buttons, 18):
-            print(f"      > Step {i}: Looking for {button_text} button...")
-            try:
-                export_button = wait.until(EC.element_to_be_clickable((By.XPATH, f"//button[span[contains(text(),'{button_text}')]]")))
-                # Use ActionChains for mouse click
-                actions = ActionChains(driver)
-                actions.move_to_element(export_button).click().perform()
-                logger.info(f"Clicked {button_text} button with mouse")
-                print(f"      > {button_text} button clicked successfully with mouse")
-                
-                # Wait for confirmation dialog
-                print(f"      > Step {i+1}: Waiting for confirmation dialog...")
-                try:
-                    wait.until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'vxe-modal--wrapper')]")))
-                    logger.info("Confirmation dialog appeared")
-                    print("      > Confirmation dialog appeared")
-                except Exception as e:
-                    logger.error(f"Confirmation dialog wait failed: {e}")
-                    print(f"      > ERROR: Confirmation dialog wait failed: {e}")
-                    continue
-                
-                # Click confirm export button using mouse
-                print(f"      > Step {i+2}: Looking for confirm export button...")
-                try:
-                    confirm_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//div[contains(@class, 'vxe-modal--wrapper')]//button[span[text()='导出']]")))
-                    # Use ActionChains for mouse click
-                    actions = ActionChains(driver)
-                    actions.move_to_element(confirm_button).click().perform()
-                    logger.info(f"Confirmed {button_text} export with mouse")
-                    print(f"      > {button_text} export confirmed successfully with mouse")
-                except Exception as e:
-                    logger.error(f"Failed to confirm {button_text} export: {e}")
-                    print(f"      > ERROR: Failed to confirm {button_text} export: {e}")
-                    continue
-                
-                # Rename downloaded file
-                print(f"      > Step {i+3}: Renaming downloaded file...")
-                file_date = date.today()
-                
-                # Determine period suffix for filename
-                period_suffix = ""
-                if isinstance(period, str) and period in ["本月", "上月"]:
-                    period_suffix = period
-                
-                success = find_and_rename_newest_file(DOWNLOADS_PATH, f"download_{report_type}_{file_suffix}", file_date, period_suffix)
-                
-                if success:
-                    logger.info(f"{button_text} export process completed successfully")
-                    print(f"      > SUCCESS: {button_text} export process completed!")
-                else:
-                    logger.error(f"{button_text} export process failed")
-                    print(f"      > ERROR: {button_text} export process failed")
-                    
-            except Exception as e:
-                logger.error(f"Failed to click {button_text} button: {e}")
-                print(f"      > ERROR: Failed to click {button_text} button: {e}")
+            # 1. 读取源CSV
+            source_df = pd.read_csv(csv_path, keep_default_na=False, dtype=str)
+            if source_df.empty:
+                print("  - [信息] CSV文件为空，跳过。")
                 continue
-        
-        return True
-            
-    except Exception as e:
-        logger.error(f"Unknown error occurred while processing report '{report_type}': {e}")
-        print(f"      > [Critical Error] Unknown error occurred while processing report '{report_type}': {e}")
-        return False
 
-def process_daily_channel_report(driver, wait, report_name):
-    """Process daily channel statistics report"""
-    logger.info(f"Starting to process daily channel report: {report_name}")
-    print(f"  Daily Channel Report - Download yesterday's data")
-    
-    # Step 7: Click left menu item
-    print(f"  Step 7: Looking for '{report_name}' menu item...")
-    try:
-        menu_item = wait.until(EC.element_to_be_clickable((By.XPATH, f"//li[normalize-space()='{report_name}']")))
-        driver.execute_script("arguments[0].click();", menu_item)
-        logger.info(f"Clicked menu item: {report_name}")
-        print(f"  Step 8: Entered '{report_name}' page, waiting for page to load...")
-    except Exception as e:
-        logger.error(f"Failed to click menu item {report_name}: {e}")
-        print(f"  ERROR: Failed to click menu item {report_name}: {e}")
-        return False
-    
-    # Step 9: Wait for page loading
-    print("  Step 9: Waiting for page loading to complete...")
-    try:
-        wait.until(EC.invisibility_of_element_located((By.CLASS_NAME, 'vxe-loading')))
-        logger.info("Page loading completed")
-        print("  Step 10: Page loading completed, elements are interactive.")
-    except Exception as e:
-        logger.error(f"Page loading timeout: {e}")
-        print(f"  WARNING: Page loading timeout: {e}")
-    
-    # Set date for yesterday
-    yesterday = date.today() - timedelta(days=1)
-    print(f"  Step 11: Setting date to yesterday: {yesterday.strftime('%Y-%m-%d')}")
-    
-    try:
-        # Click date input to open date picker
-        date_input = wait.until(EC.element_to_be_clickable((By.XPATH, "//input[@placeholder='请选择日期']")))
-        actions = ActionChains(driver)
-        actions.move_to_element(date_input).click().perform()
-        logger.info("Clicked date input to open date picker")
-        print("      > Clicked date input to open date picker")
-        
-        # Wait for date picker to appear
-        time.sleep(2)
-        
-        # Click yesterday's date in the calendar
-        yesterday_str = yesterday.strftime('%Y-%m-%d')
-        date_cell_xpath = f"//td[@class='available' and contains(@title, '{yesterday_str}')]"
-        
-        try:
-            date_cell = wait.until(EC.element_to_be_clickable((By.XPATH, date_cell_xpath)))
-            actions = ActionChains(driver)
-            actions.move_to_element(date_cell).click().perform()
-            logger.info(f"Clicked yesterday's date: {yesterday_str}")
-            print(f"      > Clicked yesterday's date: {yesterday_str}")
-        except:
-            # Fallback: try to find by text content
-            try:
-                day_text = str(yesterday.day)
-                date_cell_xpath = f"//td[@class='available']//span[text()='{day_text}']"
-                date_cell = wait.until(EC.element_to_be_clickable((By.XPATH, date_cell_xpath)))
-                actions = ActionChains(driver)
-                actions.move_to_element(date_cell).click().perform()
-                logger.info(f"Clicked yesterday's date by day number: {day_text}")
-                print(f"      > Clicked yesterday's date by day number: {day_text}")
-            except Exception as e:
-                logger.error(f"Failed to click yesterday's date: {e}")
-                print(f"      > ERROR: Failed to click yesterday's date: {e}")
-                return False
-        
-    except Exception as e:
-        logger.error(f"Failed to set date: {e}")
-        print(f"      > ERROR: Failed to set date: {e}")
-        return False
-    
-    # Click query button
-    print("      > Step 12: Looking for query button...")
-    try:
-        query_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[span[contains(text(),'查询')]]")))
-        actions = ActionChains(driver)
-        actions.move_to_element(query_button).click().perform()
-        logger.info("Clicked query button")
-        print("      > Query button clicked successfully")
-    except Exception as e:
-        logger.error(f"Failed to click query button: {e}")
-        print(f"      > ERROR: Failed to click query button: {e}")
-        return False
-    
-    # Wait for data loading
-    print("      > Step 13: Waiting for data loading...")
-    try:
-        wait.until(EC.invisibility_of_element_located((By.CLASS_NAME, 'vxe-loading')))
-        logger.info("Data loading completed")
-        print("      > Data loading completed successfully")
-    except Exception as e:
-        logger.error(f"Data loading timeout: {e}")
-        print(f"      > WARNING: Data loading timeout: {e}")
-    
-    # Export three different types
-    export_buttons = [
-        ("导出渠道质量", "channel_quality"),
-        ("导出用户质量", "user_quality"),
-        ("导出经济效益", "economic_benefit")
-    ]
-    
-    for i, (button_text, file_suffix) in enumerate(export_buttons, 14):
-        try:
-            print(f"      > Step {i}: Clicking {button_text} button...")
-            export_button = wait.until(EC.element_to_be_clickable((By.XPATH, f"//button[span[contains(text(),'{button_text}')]]")))
-            actions = ActionChains(driver)
-            actions.move_to_element(export_button).click().perform()
-            logger.info(f"Clicked {button_text} button")
-            print(f"      > {button_text} button clicked successfully")
+            # 2. 读取目标Excel Sheet
+            sheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.create_sheet(title=sheet_name)
             
-            # Wait for confirmation dialog
-            print(f"      > Step {i+1}: Waiting for confirmation dialog...")
-            try:
-                wait.until(EC.presence_of_element_located((By.XPATH, "//div[contains(@class, 'vxe-modal--wrapper')]")))
-                logger.info("Confirmation dialog appeared")
-                print("      > Confirmation dialog appeared")
-            except Exception as e:
-                logger.error(f"Confirmation dialog wait failed: {e}")
-                print(f"      > ERROR: Confirmation dialog wait failed: {e}")
-                continue
+            # 找到表头
+            excel_rows = list(sheet.iter_rows(values_only=True))
+            header_row_index = -1
+            date_col_index = -1
+            header = []
+            for i in range(min(10, len(excel_rows))):
+                row_values = [str(c).strip() if c is not None else '' for c in excel_rows[i]]
+                if date_col_name in row_values:
+                    header_row_index = i
+                    header = row_values
+                    break
             
-            # Click confirm export button
-            print(f"      > Step {i+2}: Looking for confirm export button...")
-            try:
-                confirm_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//div[contains(@class, 'vxe-modal--wrapper')]//button[span[text()='导出']]")))
-                actions = ActionChains(driver)
-                actions.move_to_element(confirm_button).click().perform()
-                logger.info(f"Confirmed {button_text} export")
-                print(f"      > {button_text} export confirmed successfully")
-            except Exception as e:
-                logger.error(f"Failed to confirm {button_text} export: {e}")
-                print(f"      > ERROR: Failed to confirm {button_text} export: {e}")
-                continue
+            if header_row_index == -1 and sheet.max_row > 0: # 表存在但找不到表头
+                 print(f"  - [警告] 在Sheet '{sheet_name}' 中找不到表头 '{date_col_name}'。将进行直接覆盖。")
+                 sheet.delete_rows(1, sheet.max_row + 1) # 清空
+                 for r in dataframe_to_rows(source_df, index=False, header=True):
+                    sheet.append(r)
+                 continue
             
-            # Rename file
-            print(f"      > Step {i+3}: Renaming downloaded file...")
-            file_date = date.today()
-            success = find_and_rename_newest_file(DOWNLOADS_PATH, f"download_{report_name}_{file_suffix}", file_date)
-            
-            if success:
-                logger.info(f"Successfully exported {button_text}")
-                print(f"      > SUCCESS: {button_text} export completed")
+            # 将Excel数据读入Pandas DataFrame
+            if sheet.max_row > header_row_index + 1:
+                target_df = pd.DataFrame(excel_rows[header_row_index+1:], columns=header)
             else:
-                logger.error(f"Failed to export {button_text}")
-                print(f"      > ERROR: {button_text} export failed")
+                target_df = pd.DataFrame(columns=header)
+            
+            # 3. 核心：标准化日期列用于匹配
+            source_df.columns = target_df.columns[:len(source_df.columns)]
+            source_df['__match_key__'] = to_standard_date(source_df[date_col_name])
+            target_df['__match_key__'] = to_standard_date(target_df[date_col_name])
+            
+            # 过滤掉无法识别的日期和汇总行
+            source_df = source_df[source_df['__match_key__'].notna()]
+            source_df = source_df[~source_df[date_col_name].str.contains("数据汇总")]
+            
+            # 4. 数据合并
+            # 将DataFrame的索引设置为匹配键
+            target_df.set_index('__match_key__', inplace=True)
+            source_df.set_index('__match_key__', inplace=True)
+            
+            # 执行更新
+            target_df.update(source_df)
+            
+            # 找出需要追加的新行
+            new_rows_df = source_df[~source_df.index.isin(target_df.index)]
+            
+            # 合并旧数据、更新数据和新数据
+            final_df = pd.concat([target_df, new_rows_df])
+            final_df.reset_index(inplace=True) # 恢复索引
+            
+            updates_count = len(source_df.index.intersection(target_df.index))
+            appends_count = len(new_rows_df)
+
+            # 5. 写回Excel
+            # 清空旧数据区域
+            if sheet.max_row > header_row_index + 1:
+                sheet.delete_rows(header_row_index + 2, sheet.max_row)
+
+            # 写入合并后的新数据
+            for index, row in final_df.iterrows():
+                # 保持原始格式，所以不写回__match_key__
+                row_to_write = row.drop('__match_key__').to_list()
                 
+                # 特殊处理LTV日期格式
+                if sheet_name == 'LTV':
+                    try:
+                        date_obj = pd.to_datetime(row[date_col_name])
+                        row_to_write[header.index(date_col_name)] = f"{date_obj.day}/{date_obj.month}/{date_obj.year}"
+                    except: pass
+                
+                sheet.append(row_to_write)
+            
+            print(f"  ✓ 处理完成：更新了 {updates_count} 行，追加了 {appends_count} 行。")
+
         except Exception as e:
-            logger.error(f"Failed to click {button_text} button: {e}")
-            print(f"      > ERROR: Failed to click {button_text} button: {e}")
-    
-    print(f"  Step 20: {report_name} report processing completed.")
-    return True
+            import traceback
+            print(f"  > [失败] 处理此文件时发生严重错误: {e}")
+            # print(traceback.format_exc())
 
-def get_channel_list(driver, wait):
-    """Get all available channels from dropdown using search method"""
-    logger.info("Starting to get all channel list using search method")
-    print("      > Getting all channel list using search method...")
-    
     try:
-        # Click channel dropdown
-        channel_dropdown_xpath = "(//div[contains(@class, 'el-select')]/div[contains(@class, 'el-select__wrapper')])[1]"
-        channel_dropdown = wait.until(EC.element_to_be_clickable((By.XPATH, channel_dropdown_xpath)))
-        actions = ActionChains(driver)
-        actions.move_to_element(channel_dropdown).click().perform()
-        logger.info("Clicked channel dropdown")
-        print("      > Clicked channel dropdown")
-        
-        # Wait for dropdown to appear
-        time.sleep(2)
-        
-        # Try to find search input in dropdown
-        search_input_xpath = "//div[contains(@class, 'el-select-dropdown')]//input"
-        search_inputs = driver.find_elements(By.XPATH, search_input_xpath)
-        
-        channels = []
-        
-        if search_inputs:
-            # Use search method
-            search_input = search_inputs[0]
-            logger.info("Found search input, using search method")
-            print("      > Found search input, using search method")
-            
-            for channel in COMPLETE_CHANNEL_LIST:
-                if channel in EXCLUDED_CHANNELS:
-                    continue
-                    
-                try:
-                    # Clear search input
-                    search_input.clear()
-                    time.sleep(0.5)
-                    
-                    # Type channel name to search
-                    search_input.send_keys(channel)
-                    time.sleep(1)
-                    
-                    # Look for matching option
-                    option_xpath = f"//div[contains(@class, 'el-select-dropdown')]//li[contains(text(), '{channel}')]"
-                    options = driver.find_elements(By.XPATH, option_xpath)
-                    
-                    if options:
-                        channels.append(channel)
-                        logger.info(f"Found channel via search: {channel}")
-                        print(f"        > Found channel via search: {channel}")
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to search for channel {channel}: {e}")
-                    continue
-        else:
-            # Fallback: get all options directly
-            logger.info("No search input found, using direct method")
-            print("      > No search input found, using direct method")
-            
-            channel_options_xpath = "//body/div[contains(@class, 'el-select-dropdown')]//li"
-            channel_elements = driver.find_elements(By.XPATH, channel_options_xpath)
-            
-            for elem in channel_elements:
-                try:
-                    channel_text = elem.text.strip()
-                    if channel_text and channel_text not in EXCLUDED_CHANNELS:
-                        channels.append(channel_text)
-                except:
-                    continue
-        
-        logger.info(f"Found {len(channels)} channels")
-        print(f"      > Found {len(channels)} channels")
-        
-        # Close dropdown by clicking elsewhere
-        driver.execute_script("document.body.click();")
-        
-        return channels
-        
+        workbook.save(output_path)
+        print("\n" + "="*50)
+        print(f"🎉 智能更新完毕！已生成新文件: {OUTPUT_EXCEL_NAME}")
+        print("="*50)
     except Exception as e:
-        logger.error(f"Failed to get channel list: {e}")
-        print(f"      > ERROR: Failed to get channel list: {e}")
-        # Return the complete channel list as fallback
-        return [ch for ch in COMPLETE_CHANNEL_LIST if ch not in EXCLUDED_CHANNELS]
+        print(f"\n[严重错误] 保存Excel文件失败: {e}")
 
-def select_channel_by_search(driver, wait, channel_name):
-    """Select a specific channel using search method"""
-    logger.info(f"Selecting channel using search: {channel_name}")
-    print(f"      > Selecting channel using search: {channel_name}")
-    
-    try:
-        # Click channel dropdown
-        channel_dropdown_xpath = "(//div[contains(@class, 'el-select')]/div[contains(@class, 'el-select__wrapper')])[1]"
-        channel_dropdown = wait.until(EC.element_to_be_clickable((By.XPATH, channel_dropdown_xpath)))
-        actions = ActionChains(driver)
-        actions.move_to_element(channel_dropdown).click().perform()
-        logger.info("Clicked channel dropdown")
-        print("      > Clicked channel dropdown")
-        
-        # Wait for dropdown to appear
-        time.sleep(2)
-        
-        # Try to find search input
-        search_input_xpath = "//div[contains(@class, 'el-select-dropdown')]//input"
-        search_inputs = driver.find_elements(By.XPATH, search_input_xpath)
-        
-        if search_inputs:
-            # Use search method
-            search_input = search_inputs[0]
-            
-            # Clear and type channel name
-            search_input.clear()
-            time.sleep(0.5)
-            search_input.send_keys(channel_name)
-            time.sleep(1)
-            
-            # Look for matching option and click it
-            option_xpath = f"//div[contains(@class, 'el-select-dropdown')]//li[contains(text(), '{channel_name}')]"
-            option = wait.until(EC.element_to_be_clickable((By.XPATH, option_xpath)))
-            actions = ActionChains(driver)
-            actions.move_to_element(option).click().perform()
-            
-            logger.info(f"Selected channel via search: {channel_name}")
-            print(f"      > Selected channel via search: {channel_name}")
-            
-        else:
-            # Fallback: direct selection
-            option_xpath = f"//body/div[contains(@class, 'el-select-dropdown')]//li[normalize-space()='{channel_name}']"
-            option = wait.until(EC.element_to_be_clickable((By.XPATH, option_xpath)))
-            actions = ActionChains(driver)
-            actions.move_to_element(option).click().perform()
-            
-            logger.info(f"Selected channel directly: {channel_name}")
-            print(f"      > Selected channel directly: {channel_name}")
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to select channel {channel_name}: {e}")
-        print(f"      > ERROR: Failed to select channel {channel_name}: {e}")
-        return False
-
-def select_multiple_channels_by_search(driver, wait, channel_list):
-    """Select multiple channels using search method"""
-    logger.info(f"Selecting multiple channels using search: {len(channel_list)} channels")
-    print(f"      > Selecting multiple channels using search: {len(channel_list)} channels")
-    
-    try:
-        # Click channel dropdown
-        channel_dropdown_xpath = "(//div[contains(@class, 'el-select')]/div[contains(@class, 'el-select__wrapper')])[1]"
-        channel_dropdown = wait.until(EC.element_to_be_clickable((By.XPATH, channel_dropdown_xpath)))
-        actions = ActionChains(driver)
-        actions.move_to_element(channel_dropdown).click().perform()
-        logger.info("Clicked channel dropdown")
-        print("      > Clicked channel dropdown")
-        
-        # Wait for dropdown to appear
-        time.sleep(2)
-        
-        # Try to find search input
-        search_input_xpath = "//div[contains(@class, 'el-select-dropdown')]//input"
-        search_inputs = driver.find_elements(By.XPATH, search_input_xpath)
-        
-        if search_inputs:
-            search_input = search_inputs[0]
-            
-            for channel in channel_list:
-                try:
-                    # Clear and type channel name
-                    search_input.clear()
-                    time.sleep(0.5)
-                    search_input.send_keys(channel)
-                    time.sleep(1)
-                    
-                    # Look for matching option and click it
-                    option_xpath = f"//div[contains(@class, 'el-select-dropdown')]//li[contains(text(), '{channel}')]"
-                    option = wait.until(EC.element_to_be_clickable((By.XPATH, option_xpath)))
-                    actions = ActionChains(driver)
-                    actions.move_to_element(option).click().perform()
-                    
-                    logger.info(f"Selected channel via search: {channel}")
-                    print(f"        > Selected channel via search: {channel}")
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to select channel {channel}: {e}")
-                    continue
-        else:
-            # Fallback: direct selection
-            for channel in channel_list:
-                try:
-                    option_xpath = f"//body/div[contains(@class, 'el-select-dropdown')]//li[normalize-space()='{channel}']"
-                    option = wait.until(EC.element_to_be_clickable((By.XPATH, option_xpath)))
-                    actions = ActionChains(driver)
-                    actions.move_to_element(option).click().perform()
-                    
-                    logger.info(f"Selected channel directly: {channel}")
-                    print(f"        > Selected channel directly: {channel}")
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to select channel {channel}: {e}")
-                    continue
-        
-        return True
-        
-    except Exception as e:
-        logger.error(f"Failed to select multiple channels: {e}")
-        print(f"      > ERROR: Failed to select multiple channels: {e}")
-        return False
-
-def process_user_retention_report(driver, wait, report_name):
-    """Process user retention reports"""
-    logger.info(f"Starting to process user retention report: {report_name}")
-    print(f"  User Retention Report - Process in two phases")
-    
-    # Phase 1: Download all platform data
-    print("  Phase 1: Download all platform data")
-    periods = ["本月", "上月"]
-    
-    for period in periods:
-        print(f"    -> Processing time period: {period}")
-        success = execute_export_flow(driver, wait, f"{report_name}_全平台", period)
-        if not success:
-            logger.error(f"Failed to process period {period} for report {report_name}")
-            print(f"      > ERROR: Failed to process period {period}")
-            return False
-    
-    # Phase 2: Traverse and download individual channel data
-    print("  Phase 2: Traverse and download individual channel data")
-    channels = get_channel_list(driver, wait)
-    
-    if not channels:
-        logger.warning("No channel list obtained, skipping individual channel download")
-        print("      > WARNING: No channel list obtained, skipping individual channel download")
-        return True
-    
-    for channel in channels:
-        try:
-            print(f"      > Processing channel: {channel}")
-            
-            # Select channel using search method
-            success = select_channel_by_search(driver, wait, channel)
-            
-            if not success:
-                logger.error(f"Failed to select channel: {channel}")
-                print(f"      > ERROR: Failed to select channel: {channel}")
-                continue
-            
-            logger.info(f"Selected channel: {channel}")
-            print(f"      > Selected channel: {channel}")
-            
-            # Download for both periods
-            for period in periods:
-                print(f"        -> Processing time period: {period}")
-                success = execute_export_flow(driver, wait, f"{report_name}_{channel}", period)
-                if success:
-                    print(f"        > SUCCESS: Channel {channel} {period} download completed")
-                else:
-                    print(f"        > ERROR: Channel {channel} {period} download failed")
-            
-        except Exception as e:
-            logger.error(f"Failed to process channel {channel}: {e}")
-            print(f"      > ERROR: Failed to process channel {channel}: {e}")
-            continue
-    
-    return True
-
-def process_ltv_report(driver, wait, report_name):
-    """Process LTV report"""
-    logger.info(f"Starting to process LTV report: {report_name}")
-    print(f"  LTV Report - Process grouped and individual channels")
-    
-    channels = get_channel_list(driver, wait)
-    
-    if not channels:
-        logger.warning("No channel list obtained, skipping LTV processing")
-        print("      > WARNING: No channel list obtained, skipping LTV processing")
-        return True
-    
-    # Process grouped channels
-    print("  Processing grouped channels...")
-    grouped_channels = set()
-    
-    for group_name, group_pattern in LTV_GROUPS.items():
-        try:
-            print(f"      > Processing group: {group_name}")
-            
-            # Select multiple channels in group using search method
-            group_channels = [ch for ch in channels if group_pattern in ch]
-            success = select_multiple_channels_by_search(driver, wait, group_channels)
-            
-            if success:
-                for channel in group_channels:
-                    grouped_channels.add(channel)
-                    print(f"        > Selected: {channel}")
-            else:
-                logger.error(f"Failed to select channels for group {group_name}")
-                print(f"      > ERROR: Failed to select channels for group {group_name}")
-                continue
-            
-            # Download for both periods
-            periods = ["本月", "上月"]
-            for period in periods:
-                print(f"        -> Processing time period: {period}")
-                success = execute_export_flow(driver, wait, f"{report_name}_{group_name}", period)
-                if success:
-                    print(f"        > SUCCESS: Group {group_name} {period} download completed")
-                else:
-                    print(f"        > ERROR: Group {group_name} {period} download failed")
-            
-            # Clear selection
-            try:
-                clear_buttons = driver.find_elements(By.XPATH, "//i[contains(@class, 'el-tag__close')]")
-                for btn in clear_buttons:
-                    driver.execute_script("arguments[0].click();", btn)
-                print(f"      > Cleared selection for {group_name}")
-            except:
-                pass
-                
-        except Exception as e:
-            logger.error(f"Failed to process group {group_name}: {e}")
-            print(f"      > ERROR: Failed to process group {group_name}: {e}")
-            continue
-    
-    # Process individual channels (not in groups)
-    print("  Processing individual channels...")
-    individual_channels = [ch for ch in channels if ch not in grouped_channels]
-    
-    for channel in individual_channels:
-        try:
-            print(f"      > Processing individual channel: {channel}")
-            
-            # Select channel using search method
-            success = select_channel_by_search(driver, wait, channel)
-            
-            if not success:
-                logger.error(f"Failed to select channel: {channel}")
-                print(f"      > ERROR: Failed to select channel: {channel}")
-                continue
-            
-            logger.info(f"Selected individual channel: {channel}")
-            print(f"      > Selected individual channel: {channel}")
-            
-            # Download for both periods
-            periods = ["本月", "上月"]
-            for period in periods:
-                print(f"        -> Processing time period: {period}")
-                success = execute_export_flow(driver, wait, f"{report_name}_{channel}", period)
-                if success:
-                    print(f"        > SUCCESS: Individual channel {channel} {period} download completed")
-                else:
-                    print(f"        > ERROR: Individual channel {channel} {period} download failed")
-            
-        except Exception as e:
-            logger.error(f"Failed to process individual channel {channel}: {e}")
-            print(f"      > ERROR: Failed to process individual channel {channel}: {e}")
-            continue
-    
-    return True
-
-def main():
-    """Main function"""
-    print("--- Automated Report Download Script (Final Version) ---")
-    
-    try:
-        # Initialize Chrome browser
-        s = Service(CHROMEDRIVER_PATH)
-        chrome_options = Options()
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_argument("--disable-web-security")
-        chrome_options.add_argument("--allow-running-insecure-content")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        
-        # Don't use user-data-dir to avoid conflicts
-        # Use random port to avoid conflicts
-        random_port = random.randint(9223, 9999)
-        chrome_options.add_argument(f"--remote-debugging-port={random_port}")
-        
-        # Additional options to prevent conflicts
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-plugins")
-        chrome_options.add_argument("--disable-default-apps")
-        chrome_options.add_argument("--disable-sync")
-        chrome_options.add_argument("--disable-translate")
-        chrome_options.add_argument("--disable-background-timer-throttling")
-        chrome_options.add_argument("--disable-renderer-backgrounding")
-        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-        chrome_options.add_argument("--disable-client-side-phishing-detection")
-        chrome_options.add_argument("--disable-hang-monitor")
-        chrome_options.add_argument("--disable-prompt-on-repost")
-        chrome_options.add_argument("--disable-domain-reliability")
-        chrome_options.add_argument("--disable-features=TranslateUI")
-        chrome_options.add_argument("--disable-ipc-flooding-protection")
-        
-        driver = webdriver.Chrome(service=s, options=chrome_options)
-        wait = WebDriverWait(driver, 60)
-        driver.maximize_window()
-        logger.info("Chrome browser initialized successfully")
-        
-        # Open login page
-        driver.get(LOGIN_URL)
-        logger.info(f"Opening login page: {LOGIN_URL}")
-        print("✓ Opened login page")
-        
-        print("\n" + "=" * 60)
-        print("脚本已暂停！")
-        print("=" * 60)
-        print("请您在打开的浏览器窗口中，手动完成所有登录步骤：")
-        print("1. 输入账号")
-        print("2. 输入密码")
-        print("3. 输入验证码")
-        print("4. 点击登录")
-        print("完全登录成功，并看到网站主页后，请回到此窗口按 Enter 键继续...")
-        print("=" * 60)
-        
-        try:
-            input("After successful login and seeing the homepage, press Enter to continue...")
-        except EOFError:
-            print("Input interrupted, continuing with script...")
-        
-        logger.info("User confirmed login completion, starting report download tasks")
-        print("=" * 60)
-        print("脚本恢复，开始下载报表...")
-        print("=" * 60 + "\n")
-
-        # Define all reports to be processed
-        reports = [
-            {"name": "运营统计", "type": "standard"},
-            {"name": "用户留存率(首充复登)", "type": "user_retention"},
-            {"name": "用户留存率(首充复充)", "type": "user_retention"},
-            {"name": "赠送类型统计", "type": "standard"},
-            {"name": "推广渠道统计", "type": "promotion_channel"},
-            {"name": "每日渠道统计", "type": "daily_channel"},
-            {"name": "LTV", "type": "ltv"},
-        ]
-
-        logger.info(f"Starting to process {len(reports)} reports")
-        
-        for i, report in enumerate(reports, 1):
-            logger.info(f"Starting to process report {i}/{len(reports)}: {report['name'].encode('ascii', 'ignore').decode('ascii')}")
-            print(f"\n{'='*20} Report {i}/{len(reports)}: {report['name']} {'='*20}")
-            
-            try:
-                # Click left main menu to enter report page
-                menu_xpath = f"//li[normalize-space()='{report['name']}']"
-                menu_item = wait.until(EC.element_to_be_clickable((By.XPATH, menu_xpath)))
-                driver.execute_script("arguments[0].click();", menu_item)
-                logger.info(f"Clicked menu item: {report['name']}")
-                print(f"  Entered '{report['name']}' page, waiting for page to load...")
-                
-                # Wait for page to load
-                long_wait = WebDriverWait(driver, 60)
-                long_wait.until(EC.invisibility_of_element_located((By.CLASS_NAME, 'vxe-loading')))
-                logger.info(f"Page {report['name']} loaded successfully")
-                print(f"  Page loaded successfully, elements are interactive.")
-                
-                # Process report based on type
-                if report['type'] == "standard":
-                    success = process_standard_report(driver, wait, report['name'])
-                elif report['type'] == "promotion_channel":
-                    success = process_promotion_channel_report(driver, wait, report['name'])
-                elif report['type'] == "daily_channel":
-                    success = process_daily_channel_report(driver, wait, report['name'])
-                elif report['type'] == "user_retention":
-                    success = process_user_retention_report(driver, wait, report['name'])
-                elif report['type'] == "ltv":
-                    success = process_ltv_report(driver, wait, report['name'])
-                else:
-                    logger.error(f"Unknown report type: {report['type']}")
-                    print(f"  ERROR: Unknown report type: {report['type']}")
-                    success = False
-                
-                if success:
-                    logger.info(f"Report {report['name']} processed successfully")
-                    print(f"  SUCCESS: Report {report['name']} completed")
-                else:
-                    logger.error(f"Report {report['name']} processing failed")
-                    print(f"  ERROR: Report {report['name']} failed")
-                
-            except Exception as e:
-                logger.error(f"Unknown error occurred while processing report '{report['name']}': {e}")
-                print(f"  [Critical Error] Unknown error occurred while processing report '{report['name']}': {e}")
-                print(f"  Attempting to refresh page and continue with next task...")
-                
-                try:
-                    driver.refresh()
-                    time.sleep(5)
-                except:
-                    pass
-        
-        print("\n" + "=" * 60)
-        print("全部任务执行完毕！")
-        print("=" * 60)
-
-    except Exception as e:
-        logger.error(f"Critical error occurred during script execution: {e}")
-        print(f"\nCritical error occurred during script execution: {e}")
-    finally:
-        if 'driver' in locals():
-            logger.info("Closing browser")
-            driver.quit()
-            print("Chrome浏览器已关闭")
-        
-        logger.info("=== Script execution ended ===")
-        print("脚本运行结束")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    smart_update_excel_v10()
