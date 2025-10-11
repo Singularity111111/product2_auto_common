@@ -1,0 +1,178 @@
+import os
+import glob
+import pandas as pd
+import openpyxl
+import shutil
+
+# =============================== 配置区 ==================================
+# 您的原始模板 Excel 文件名
+SOURCE_EXCEL_NAME = '产品二-VNL日报-10月 (13).xlsx'
+
+# 定义输出文件名
+OUTPUT_EXCEL_NAME = SOURCE_EXCEL_NAME.replace('.xlsx', '_updated_v7.xlsx')
+
+# 定义“源文件关键字”与“目标Sheet”、“日期列名”以及“起始列”的映射规则
+# 格式: '文件名关键字': ('Sheet名', '日期列名', 起始写入列)
+# ★★★ C列对应的是 3，A列对应的是 1 ★★★
+REPORT_MAP = {
+    # 主要数据表
+    '运营统计': ('后台', '时间', 3), 
+    '用户留存率(首充复登)_全平台': ('首充复登', '时间', 1),
+    '用户留存率(首充复充)_全平台': ('首充复充', '时间', 1),
+    'LTV全平台': ('LTV', '时间', 3), # <--- 关键修改：将LTV的起始列从 1 改为 3
+
+    # 推广渠道统计的三个文件，写入新Sheet时默认从第1列开始
+    '推广渠道统计-渠道质量': ('推广-渠道质量', '日期', 1),
+    '推广渠道统计-用户质量': ('推广-用户质量', '日期', 1),
+    '推广渠道统计-经济效益': ('推广-经济效益', '日期', 1),
+
+    # 其他单页报表
+    '赠送类型统计': ('赠送类型统计', '日期', 1),
+    '每日渠道统计': ('每日渠道统计', '日期', 1),
+}
+# ========================================================================
+
+def smart_update_excel_v7():
+    """
+    智能更新Excel V7 版：
+    - 修正了LTV Sheet的起始列，解决最终的错位问题。
+    - 继承之前版本所有功能。
+    """
+    current_directory = os.getcwd()
+    source_path = os.path.join(current_directory, SOURCE_EXCEL_NAME)
+    output_path = os.path.join(current_directory, OUTPUT_EXCEL_NAME)
+
+    print(f"--- 启动智能更新程序 (V7 - 最终完美对齐版) ---")
+
+    # 1. 检查并复制模板文件
+    if not os.path.exists(source_path):
+        print(f"\n[错误] 模板文件 '{SOURCE_EXCEL_NAME}' 不存在。")
+        return
+    try:
+        shutil.copy(source_path, output_path)
+        print(f"✓ 已创建安全副本: {OUTPUT_EXCEL_NAME}")
+    except Exception as e:
+        print(f"\n[错误] 创建副本失败: {e}")
+        return
+
+    # 2. 查找CSV文件
+    csv_files = glob.glob(os.path.join(current_directory, '*.csv'))
+    if not csv_files:
+        print("\n[警告] 未找到任何CSV源文件。")
+        return
+    print(f"✓ 找到 {len(csv_files)} 个CSV文件准备处理...")
+
+    # 3. 加载工作簿
+    try:
+        workbook = openpyxl.load_workbook(output_path)
+    except Exception as e:
+        print(f"\n[错误] 打开Excel副本失败: {e}")
+        return
+
+    # 4. 核心处理逻辑
+    for csv_path in csv_files:
+        filename = os.path.basename(csv_path)
+        mapping = None
+
+        for keyword, value in sorted(REPORT_MAP.items(), key=lambda item: len(item[0]), reverse=True):
+            if keyword in filename:
+                mapping = value
+                break
+        
+        if not mapping:
+            continue
+
+        sheet_name, date_col_name, start_col = mapping
+        print(f"\n+ [处理中] '{filename}' -> Sheet: '{sheet_name}' (从第 {start_col} 列开始)")
+
+        try:
+            # 读取CSV
+            try:
+                source_df = pd.read_csv(csv_path, dtype=str).fillna('')
+            except UnicodeDecodeError:
+                source_df = pd.read_csv(csv_path, dtype=str, encoding='gbk').fillna('')
+            if source_df.empty:
+                print("  - [信息] CSV文件为空，跳过。")
+                continue
+
+            # 获取或创建Sheet
+            sheet = workbook[sheet_name] if sheet_name in workbook.sheetnames else workbook.create_sheet(title=sheet_name)
+
+            # 定位日期列在Excel中的实际列号
+            date_col_index_in_excel = -1
+            target_data = list(sheet.values)
+            target_df_for_header = pd.DataFrame(target_data)
+            for i in range(min(5, len(target_df_for_header))): 
+                row_values = [str(c).strip() if c is not None else '' for c in target_df_for_header.iloc[i]]
+                if date_col_name in row_values:
+                    date_col_index_in_excel = row_values.index(date_col_name)
+                    break
+            
+            # 定位日期列在CSV中的列号
+            date_col_index_in_csv = 0
+            # HACK: Handle potential duplicate columns in CSV by taking the first one
+            if isinstance(source_df.columns, pd.MultiIndex):
+                csv_cols = source_df.columns.get_level_values(0).tolist()
+            else:
+                csv_cols = source_df.columns.tolist()
+            if date_col_name in csv_cols:
+                date_col_index_in_csv = csv_cols.index(date_col_name)
+
+            # 建立日期 -> 行号的映射
+            date_to_row_map = {}
+            if date_col_index_in_excel != -1:
+                date_to_row_map = {
+                    str(row[date_col_index_in_excel]).strip(): (idx + 1)
+                    for idx, row in enumerate(sheet.iter_rows(values_only=True))
+                    if len(row) > date_col_index_in_excel and row[date_col_index_in_excel] is not None and str(row[date_col_index_in_excel]).strip()
+                }
+
+            updates_count = 0
+            appends_count = 0
+
+            # 遍历源数据
+            for index, source_row in source_df.iterrows():
+                date_val = str(source_row.iloc[date_col_index_in_csv]).strip()
+
+                if "数据汇总" in date_val:
+                    continue
+
+                # 更新现有行
+                if date_val in date_to_row_map:
+                    row_num = date_to_row_map[date_val]
+                    is_different = False
+                    for col_idx, value in enumerate(source_row):
+                        target_cell = sheet.cell(row=row_num, column=col_idx + start_col)
+                        source_val = str(value).strip()
+                        target_val = str(target_cell.value if target_cell.value is not None else '').strip()
+                        if source_val != target_val:
+                            target_cell.value = value
+                            is_different = True
+                    if is_different:
+                        updates_count += 1
+                # 追加新行
+                else:
+                    new_row_num = sheet.max_row + 1 if sheet.max_row > 0 else 1
+                    # A special check for completely empty sheets
+                    if sheet.max_row == 1 and all(c.value is None for c in sheet[1]):
+                        new_row_num = 1
+                    for col_idx, value in enumerate(source_row.to_list()):
+                        sheet.cell(row=new_row_num, column=col_idx + start_col, value=value)
+                    appends_count += 1
+            
+            print(f"  ✓ 处理完成：更新了 {updates_count} 行，追加了 {appends_count} 行。")
+
+        except Exception as e:
+            print(f"  > [失败] 处理此文件时发生严重错误: {e}")
+
+    # 5. 保存
+    try:
+        workbook.save(output_path)
+        print("\n" + "="*50)
+        print(f"🎉 智能更新完毕！已生成新文件: {OUTPUT_EXCEL_NAME}")
+        print("="*50)
+    except Exception as e:
+        print(f"\n[严重错误] 保存Excel文件失败: {e}")
+
+if __name__ == '__main__':
+    smart_update_excel_v7()
