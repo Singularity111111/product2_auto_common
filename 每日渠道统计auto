@@ -1,0 +1,320 @@
+# -*- coding: utf-8 -*-
+"""
+每日渠道统计 —— 按“分组名称”纵向合并三张最新CSV，并写入新日期段（只写数据，不清理/不合并）
+- 仅处理 Sheet「每日渠道统计」
+- 读取目录中最新的：
+    * 每日渠道统计-渠道质量*.csv   → K~V
+    * 每日渠道统计-用户质量*.csv   → W~AO
+    * 每日渠道统计-经济效益*.csv   → AP~（自动到块末）
+- 以“分组名称”为键，把三张表的同名分组合并为“同一行”（每个分组一行）
+- 起写位置：找到“新日期段”的“分组名称”那一行 → 从其下一行开始连续写入
+- 仅写数值（不改 A~J、不清格式、不解除合并）
+- 特别规则：AQ 列（充值金额） = 经济效益CSV的“总收入（B列）”，已做同义词与B列兜底
+"""
+
+import os
+import glob
+import string
+import traceback
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.worksheet.worksheet import Worksheet
+
+SHEET_NAME    = "每日渠道统计"
+TEMPLATE_XLSX = "需要覆盖的文件.xlsx"
+OUTPUT_XLSX   = "需要覆盖的文件_updated_final.xlsx"
+
+# 三个块
+BLOCK_QZ = ("K", "V")    # 渠道质量
+BLOCK_YZ = ("W", "AO")   # 用户质量
+BLOCK_JX = ("AP", None)  # 经济效益（向右自动探测到该块末）
+
+# —— 表头标准化 / 同义词（仅用于匹配，不改真实表头） ——
+CANON_SYNONYMS = {
+    # 日期（仅兼容，不写 A 列）
+    "时间": "日期", "date": "日期", "day": "日期", "dt": "日期", "统计日期": "日期",
+
+    # 消耗
+    "花费": "消耗", "花费元": "消耗", "费用": "消耗", "消费": "消耗", "成本": "消耗",
+    "推广消耗": "消耗", "广告花费": "消耗", "spend": "消耗", "adspend": "消耗",
+    "cost": "消耗", "expense": "消耗", "adcost": "消耗",
+
+    # 展示/点击/注册
+    "曝光": "展示", "展示量": "展示", "impressions": "展示",
+    "点击量": "点击", "clicks": "点击",
+    "激活": "注册", "新增": "注册", "注册量": "注册", "installs": "注册", "newuser": "注册",
+
+    # 充值/收入
+    "付费金额": "充值金额", "revenue": "充值金额", "总收入": "充值金额",
+    "充值金額": "充值金额",  # 繁体“額”
+
+    # ROI/ARPU
+    "arpu": "ARPU", "arppu": "ARPPU",
+
+    # 来源
+    "平台来源": "来源", "来源渠道": "来源", "渠道来源": "来源",
+
+    # 分组列
+    "分组": "分组名称", "group": "分组名称", "groupname": "分组名称",
+}
+
+def _to_halfwidth(s: str) -> str:
+    if not isinstance(s, str):
+        s = "" if s is None else str(s)
+    out = []
+    for ch in s:
+        code = ord(ch)
+        if code == 0x3000: code = 0x0020
+        elif 0xFF01 <= code <= 0xFF5E: code -= 0xFEE0
+        out.append(chr(code))
+    return "".join(out)
+
+def _norm(s: str) -> str:
+    if s is None: s = ""
+    s = _to_halfwidth(str(s)).strip().lower()
+    s = "".join(s.split())
+    remove = str.maketrans("", "", string.punctuation + "·•—–-－_　、，；：:／/\\()（）[]【】<>《》“”\"'‘’+|")
+    s = s.translate(remove)
+    if s in CANON_SYNONYMS: s = CANON_SYNONYMS[s]
+    return s
+
+def read_csv_smart(path: str) -> pd.DataFrame:
+    if not path: return pd.DataFrame()
+    for enc in ["utf-8-sig", "utf-8", "gbk"]:
+        try:
+            df = pd.read_csv(path, engine="python", sep=None, encoding=enc)
+            df = df.dropna(how="all")
+            df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
+            return df
+        except Exception:
+            pass
+    try:
+        df = pd.read_csv(path, engine="python", sep=",", encoding="gbk", encoding_errors="ignore")
+        df = df.dropna(how="all")
+        df = df.loc[:, ~df.columns.astype(str).str.startswith("Unnamed")]
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+def latest_csv(pattern: str) -> Optional[str]:
+    files = glob.glob(pattern)
+    if not files: return None
+    files.sort(key=lambda p: os.path.getmtime(p))
+    return files[-1]
+
+# —— Excel 辅助 ——
+def col_letter_to_index(letter: str) -> int:
+    return column_index_from_string(letter.upper())
+
+def detect_segment_end(ws: Worksheet, start_col_idx: int, next_start_col_idx: Optional[int]) -> int:
+    """若未给 end，则从表头行向右扫，遇到连续3个空表头停止"""
+    if next_start_col_idx:
+        return next_start_col_idx - 1
+    header_row = 1
+    c = start_col_idx
+    empty_streak, end_col = 0, c
+    max_scan = ws.max_column or (start_col_idx + 80)
+    while c <= max_scan:
+        v = ws.cell(row=header_row, column=c).value
+        if v is None or str(v).strip() == "":
+            empty_streak += 1
+            if empty_streak >= 3: break
+        else:
+            empty_streak = 0
+            end_col = c
+        c += 1
+    return end_col
+
+def get_block_headers(ws: Worksheet, start_idx: int, end_idx: int) -> List[str]:
+    headers = []
+    for c in range(start_idx, end_idx + 1):
+        v = ws.cell(row=1, column=c).value
+        headers.append("" if v is None else str(v).strip())
+    while headers and headers[-1] == "":
+        headers.pop()
+    return headers
+
+def find_new_date_header_row(ws: Worksheet) -> Optional[int]:
+    """
+    在K列自底向上找“分组名称”这个标识行（你已手动插好），返回其行号。
+    若找不到，返回 None。
+    """
+    K = col_letter_to_index("K")
+    for r in range(ws.max_row, 1, -1):
+        v = ws.cell(row=r, column=K).value
+        if str(v).strip() == "分组名称":
+            return r
+    return None
+
+def build_header_mapping(target_headers: List[str], csv_headers: List[str]) -> Dict[str, Optional[str]]:
+    mapping = {}
+    t_norm = {h: _norm(h) for h in target_headers}
+    c_norm = {c: _norm(c) for c in csv_headers}
+    norm_to_csv = {}
+    for c, cn in c_norm.items():
+        if cn and cn not in norm_to_csv:
+            norm_to_csv[cn] = c
+    for h in target_headers:
+        hn = t_norm[h]
+        if hn in norm_to_csv:
+            mapping[h] = norm_to_csv[hn]; continue
+        if h in csv_headers:
+            mapping[h] = h; continue
+        # 模糊包含
+        cands = [csv for csv, cn in c_norm.items() if cn and (cn == hn or hn in cn or cn in hn)]
+        mapping[h] = cands[0] if cands else None
+    return mapping
+
+def align_row_from_df(df_row: pd.DataFrame, target_headers: List[str], mapping: Dict[str, Optional[str]]) -> List:
+    vals = []
+    for h in target_headers:
+        src = mapping.get(h)
+        if (src is None) or (src not in df_row.columns):
+            vals.append(None)
+        else:
+            vals.append(df_row.iloc[0][src])
+    return vals
+
+def detect_group_col(df: pd.DataFrame) -> Optional[str]:
+    if df.empty: return None
+    cands = [c for c in df.columns if _norm(c) == "分组名称"]
+    if cands: return cands[0]
+    # 宽松些
+    for c in df.columns:
+        n = _norm(c)
+        if ("组" in str(c)) or (n in ("group", "groupname")):
+            return c
+    return None
+
+def write_row(ws: Worksheet, row_idx: int, col_start_idx: int, values: List):
+    for i, v in enumerate(values):
+        ws.cell(row=row_idx, column=col_start_idx + i, value=None if (isinstance(v, float) and pd.isna(v)) else v)
+
+# —— 主业务：纵向合并（按分组名称） ——
+def main():
+    # 选择Excel：优先 updated_final，否则模板
+    xlsx = OUTPUT_XLSX if os.path.exists(OUTPUT_XLSX) else TEMPLATE_XLSX
+    if not os.path.exists(xlsx):
+        print(f"[FATAL] 找不到 Excel：{xlsx}")
+        return
+    wb = load_workbook(xlsx)
+    if SHEET_NAME not in wb.sheetnames:
+        print(f"[FATAL] 工作簿不存在 Sheet：{SHEET_NAME}")
+        return
+    ws: Worksheet = wb[SHEET_NAME]
+
+    # 找到“新日期段”的分组名称行
+    header_r = find_new_date_header_row(ws)
+    if not header_r:
+        print("[ERROR] 找不到新日期段的『分组名称』行。请先在K列放置一行『分组名称』作为本次写入的起点。")
+        return
+    start_r = header_r + 1  # 数据从下一行开始
+
+    # 三类CSV（你已下好最新的，我们仍按修改时间取各自最新）
+    f_qz = latest_csv("*每日渠道统计-渠道质量*.csv")
+    f_yz = latest_csv("*每日渠道统计-用户质量*.csv")
+    f_jx = latest_csv("*每日渠道统计-经济效益*.csv")
+
+    df_qz = read_csv_smart(f_qz)
+    df_yz = read_csv_smart(f_yz)
+    df_jx = read_csv_smart(f_jx)
+
+    # 分组列
+    g_qz, g_yz, g_jx = detect_group_col(df_qz), detect_group_col(df_yz), detect_group_col(df_jx)
+    if not any([g_qz, g_yz, g_jx]):
+        print("[ERROR] 三张CSV都未找到分组列（如 分组名称 / 分组 / group 等）。")
+        return
+
+    # 分组合并顺序：以 渠道质量 的分组顺序为主，其它补充在后
+    groups = []
+    def extend_groups(df, gcol):
+        if (df is None) or df.empty or (gcol is None): return
+        for x in df[gcol].astype(str).tolist():
+            x2 = _to_halfwidth(x).strip()
+            if x2 and x2 not in groups:
+                groups.append(x2)
+    extend_groups(df_qz, g_qz)
+    extend_groups(df_yz, g_yz)
+    extend_groups(df_jx, g_jx)
+
+    # 准备三个块的表头与映射
+    # 渠道质量 K~V
+    s_qz = col_letter_to_index(BLOCK_QZ[0])
+    e_qz = detect_segment_end(ws, s_qz, col_letter_to_index(BLOCK_QZ[1]))
+    headers_qz = get_block_headers(ws, s_qz, e_qz)
+
+    # 用户质量 W~AO
+    s_yz = col_letter_to_index(BLOCK_YZ[0])
+    e_yz = detect_segment_end(ws, s_yz, col_letter_to_index(BLOCK_YZ[1]))
+    headers_yz = get_block_headers(ws, s_yz, e_yz)
+
+    # 经济效益 AP~*
+    s_jx = col_letter_to_index(BLOCK_JX[0])
+    e_jx = detect_segment_end(ws, s_jx, col_letter_to_index(BLOCK_JX[1]) if BLOCK_JX[1] else None)
+    headers_jx = get_block_headers(ws, s_jx, e_jx)
+
+    map_qz = build_header_mapping(headers_qz, list(df_qz.columns)) if not df_qz.empty else {}
+    map_yz = build_header_mapping(headers_yz, list(df_yz.columns)) if not df_yz.empty else {}
+    map_jx = build_header_mapping(headers_jx, list(df_jx.columns)) if not df_jx.empty else {}
+
+    # 经济效益块：强制 AQ（充值金额） ← 总收入(B列) 兜底
+    try:
+        norm_jx = [_norm(h) for h in headers_jx]
+        if "充值金额" in norm_jx:
+            aq_idx = norm_jx.index("充值金额")
+            tgt_h = headers_jx[aq_idx]
+            src = map_jx.get(tgt_h)
+            # 若映射不到，尽量找“总收入/充值金额/revenue”，再不行用B列
+            if (src is None) or (src not in (list(df_jx.columns) if df_jx is not None else [])):
+                cands = []
+                if df_jx is not None:
+                    cands = [c for c in df_jx.columns if _norm(c) in ("总收入", "充值金额", "revenue", "付费金额")]
+                if cands:
+                    map_jx[tgt_h] = cands[0]
+                elif (df_jx is not None) and (df_jx.shape[1] >= 2):
+                    map_jx[tgt_h] = df_jx.columns[1]  # B列兜底
+    except Exception:
+        traceback.print_exc()
+
+    # 建立三个数据表按“分组名称”索引的行（取第一条匹配）
+    def row_by_group(df, gcol, group_val) -> Optional[pd.DataFrame]:
+        if df is None or df.empty or gcol is None: return None
+        m = df[df[gcol].astype(str).apply(lambda x: _to_halfwidth(x).strip() == group_val)]
+        if m.empty: return None
+        return m.iloc[[0]]
+
+    # 逐组写入：从 start_r 开始
+    cur_r = start_r
+    for g in groups:
+        # 渠道质量
+        if headers_qz:
+            r_qz = row_by_group(df_qz, g_qz, g)
+            if r_qz is not None:
+                vals = align_row_from_df(r_qz.reset_index(drop=True), headers_qz, map_qz)
+                write_row(ws, cur_r, s_qz, vals)
+        # 用户质量
+        if headers_yz:
+            r_yz = row_by_group(df_yz, g_yz, g)
+            if r_yz is not None:
+                vals = align_row_from_df(r_yz.reset_index(drop=True), headers_yz, map_yz)
+                write_row(ws, cur_r, s_yz, vals)
+        # 经济效益
+        if headers_jx:
+            r_jx = row_by_group(df_jx, g_jx, g)
+            if r_jx is not None:
+                vals = align_row_from_df(r_jx.reset_index(drop=True), headers_jx, map_jx)
+                write_row(ws, cur_r, s_jx, vals)
+
+        cur_r += 1
+
+    wb.save(xlsx)
+    print(f"+ 每日渠道统计 | 写入完成：起始行={start_r} 组数={len(groups)}")
+    print(os.path.abspath(xlsx))
+
+if __name__ == "__main__":
+    pd.set_option("display.max_columns", 200)
+    pd.set_option("display.width", 240)
+    main()
