@@ -1,0 +1,1119 @@
+import pandas as pd
+import glob
+import os
+import re
+from openpyxl.utils import get_column_letter
+from openpyxl.styles import Alignment
+from datetime import datetime, timedelta
+
+# --- 1. 配置区 ---
+CONFIG = {
+    "PLATFORM_NAME": "vnl平台",
+    "OUTPUT_FILENAME": "最终生成的报表.xlsx"
+}
+
+# --- 2. 各Sheet的最终列名定义 ---
+BACKEND_TARGET_COLUMNS = [
+    '平台', '时间', '新增人员', '活跃人数', '充值人数', '商城充值次数', '总赠送', '商城充值金额', '实际到账金币', '笔次均值', '人均充值', '提现人数', '商城提现次数', '商城提现金额', '实际提现金额', 'ARPU', '当日总流水', '当日总返奖', '当日总盈利', '充值投注人数', '新增充值人数', '新增绑定比', '今日投充比', '首充次日复投率', '首充3日复投率', '首充7日复投率', '首充用户总充值金额', 'PWA数量', '投注人数', '一级新充人数', '一级新充金额', '一级首充人数', '一级首充金额', '新充金额', '首充人数', '首笔汇总', '充提差'
+]
+CHANNEL_TARGET_COLUMNS = [
+    '首充金额', '日期', '首充', '一级首充', '非首充', '新增人员', '新增充值', '一级新充', '裂变占比', '新增/首充率', '老用户充值', '活跃充值', '提现人数', '提现金额', '提现率', '首充提现率(人数)', '首充提现率(金额)', '老用户付费率', '老用户付费占比', '活跃付费率', 'ARPU'
+]
+RETENTION_COLUMNS = ['时间', '首充人数', '次日', '3日', '4日', '5日', '6日', '7日', '8日', '9日', '10日', '11日', '12日', '13日', '14日', '15日', '16日', '17日', '18日', '19日', '20日', '21日', '22日', '23日', '24日', '25日', '26日', '27日', '28日', '29日', '30日']
+
+CHANNEL_RULES = [
+    {'代码': '1102', '名称': 'TL_333_XXX_AAA_DP', '分类': '投放'},
+    {'代码': '1103', '名称': 'TL_333_XXX_AAA_JG', '分类': '投放'},
+    {'代码': '1104', '名称': 'TL_111_KKK_BBB_A8', '分类': '投放'},
+    {'代码': '1105', '名称': 'TL_111_KKK_BBB_TF', '分类': '投放'},
+    {'代码': '1106', '名称': 'TL_111_KKK_BBB_XN', '分类': '投放'},
+    {'代码': '1107', '名称': 'TL_333_XXX_AAA_A81', '分类': '网红'},
+    {'代码': '1108', '名称': 'TL_111_KKK_BBB_A82', '分类': '投放'},
+    {'代码': '1109', '名称': 'TL_222_III_AAA_HZ', '分类': '投放'},
+    {'代码': '1110', '名称': 'TL_111_GGG_AAA_A8', '分类': '投放'},
+    {'代码': '1111', '名称': 'TL_111_KKK_BBB_OK', '分类': '投放'},
+    {'代码': '1112', '名称': 'TL_111_QQQ_AAA_A8SEO', '分类': '投放'},
+    {'代码': '1113', '名称': 'TL_333_XXX_AAA_DX2', '分类': '短信'},
+]
+
+# --- 3. Sheet生成与格式化函数 ---
+
+# <--- 此函数已被重写，以解决核心逻辑问题
+def process_cumulative_files(files, date_col_name, sort_by_col=None):
+    """
+    一个更健壮的函数，用于处理随时间累积的报表文件。
+    它会合并所有文件，然后智能地排序，以确保每个日期都保留数据最完整的那一行。
+    """
+    if not files: 
+        print(f"  警告：没有找到文件")
+        return None
+    
+    try:
+        print(f"  正在处理 {len(files)} 个文件...")
+        df = pd.concat([pd.read_csv(f, sep=',', engine='python', on_bad_lines='skip', encoding='utf-8') for f in files], ignore_index=True)
+        
+        df.columns = df.columns.str.strip()
+        print(f"  文件列名: {list(df.columns)}")
+        
+        if date_col_name not in df.columns: 
+            print(f"  错误：找不到日期列 '{date_col_name}'")
+            return None
+        
+        df = df[~df[date_col_name].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+        df[date_col_name] = pd.to_datetime(df[date_col_name], errors='coerce')
+        df.dropna(subset=[date_col_name], inplace=True)
+
+        if df.empty:
+            print(f"  警告：过滤后数据为空")
+            return None
+
+        # 核心逻辑：在去重前，先按日期和数据完整性排序
+        # 如果指定了 sort_by_col，则按其排序；否则自动计算“留存列的完整度”
+        sort_columns = [date_col_name]
+        if sort_by_col and sort_by_col in df.columns:
+            sort_columns.append(sort_by_col)
+            print(f"  使用列 '{sort_by_col}' 进行数据完整性排序")
+            df.sort_values(by=sort_columns, ascending=True, na_position='first', inplace=True)
+        else:
+            # 自动识别留存相关列（包含“日”且不是日期列）
+            retention_like_cols = [c for c in df.columns if c != date_col_name and ('日' in str(c) or re.match(r'^[Dd](\d+)', str(c)))]
+            if retention_like_cols:
+                completeness_col = '__completeness__'
+                df[completeness_col] = df[retention_like_cols].notna().sum(axis=1)
+                print(f"  按留存列完整度排序，涉及列数: {len(retention_like_cols)}")
+                # 低完整度在前，高完整度在后；去重时保留最后一条（最完整）
+                df.sort_values(by=[date_col_name, completeness_col], ascending=[True, True], na_position='first', inplace=True)
+            else:
+                print(f"  未找到排序列 '{sort_by_col}'，仅按日期排序")
+        df.sort_values(by=sort_columns, ascending=True, na_position='first', inplace=True)
+
+        # 现在去重，可以安全地保留最后一条（即最完整）的记录
+        original_count = len(df)
+        df.drop_duplicates(subset=[date_col_name], keep='last', inplace=True)
+        if '__completeness__' in df.columns:
+            df.drop(columns='__completeness__', inplace=True)
+        print(f"  去重前: {original_count} 行，去重后: {len(df)} 行")
+        
+        return df
+    except Exception as e:
+        print(f"  处理文件 {files} 时出错: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def generate_backend_sheet(data_files):
+    # 使用新的健壮的处理函数
+    df = process_cumulative_files(data_files, '时间', sort_by_col='当日总盈利')
+    if df is None or df.empty: return None
+    
+    df = df.sort_values(by='时间').reset_index(drop=True)
+    final_df = pd.DataFrame()
+    for col in BACKEND_TARGET_COLUMNS:
+        final_df[col] = df[col] if col in df.columns else None
+    final_df['平台'] = CONFIG["PLATFORM_NAME"]
+    final_df['时间'] = final_df['时间'].dt.strftime('%#d/%#m/%Y')
+    return final_df[BACKEND_TARGET_COLUMNS]
+
+
+def generate_channel_sheet(quality_files, user_files, economic_files):
+    # 对于渠道统计，它只有一个文件，可以直接合并
+    if not all([quality_files, user_files, economic_files]): return None
+    try:
+        df_q = pd.read_csv(quality_files[0], sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+        df_u = pd.read_csv(user_files[0], sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+        df_e = pd.read_csv(economic_files[0], sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+        
+        merged = pd.merge(df_q, df_u, on='日期', how='outer', suffixes=('_q', '_u'))
+        merged = pd.merge(merged, df_e, on='日期', how='outer')
+
+        # 清洗数据
+        merged = merged[~merged['日期'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+        merged['日期'] = pd.to_datetime(merged['日期'], errors='coerce')
+        merged.dropna(subset=['日期'], inplace=True)
+        
+        if '首充' in merged.columns:
+            merged['首充金额'] = merged['首充'].astype(str).str.split(' | ', expand=True).get(0)
+        if '新增人员_u' in merged.columns:
+            merged['新增人员'] = merged['新增人员_u']
+            
+        final_df = pd.DataFrame()
+        for col in CHANNEL_TARGET_COLUMNS:
+            final_df[col] = merged[col] if col in merged.columns else None
+            
+        final_df = final_df.sort_values(by='日期').reset_index(drop=True)
+        final_df['日期'] = final_df['日期'].dt.strftime('%#d/%#m/%Y')
+        return final_df[CHANNEL_TARGET_COLUMNS]
+    except Exception as e:
+        print(f"  处理'推广渠道统计'sheet时出错: {e}")
+        return None
+
+def format_retention_sheet(writer, df, sheet_name, summary_cols):
+    workbook = writer.book
+    worksheet = workbook.create_sheet(title=sheet_name)
+    summary_headers = ['时间', '首充人数', '留存率']
+    for c_idx, val in enumerate(summary_headers, 1):
+        worksheet.cell(row=1, column=c_idx).value = val
+    worksheet.merge_cells(start_row=1, start_column=3, end_row=1, end_column=2 + len(summary_cols))
+    for c_idx, val in enumerate(summary_cols, 3):
+        worksheet.cell(row=2, column=c_idx).value = val
+    detail_start_col = 5 + len(summary_cols)
+    detail_headers = ['时间', '首充人数', '留存率']
+    for c_idx, val in enumerate(detail_headers, detail_start_col):
+        worksheet.cell(row=1, column=c_idx).value = val
+    detail_retention_cols = [c for c in RETENTION_COLUMNS if c not in ['时间', '首充人数']]
+    worksheet.merge_cells(start_row=1, start_column=detail_start_col + 2, end_row=1, end_column=detail_start_col + 1 + len(detail_retention_cols))
+    for c_idx, val in enumerate(detail_retention_cols, detail_start_col + 2):
+        worksheet.cell(row=2, column=c_idx).value = val
+    df_columns = list(df.columns)
+    for r_idx, (_, row) in enumerate(df.iterrows(), 3):
+        time_val = row.get('时间', '')
+        first_pay_count = row.get('首充人数', '')
+        worksheet.cell(row=r_idx, column=1).value = time_val
+        worksheet.cell(row=r_idx, column=2).value = first_pay_count
+        for c_idx, col_name in enumerate(summary_cols, 3):
+            if col_name in df_columns:
+                worksheet.cell(row=r_idx, column=c_idx).value = row.get(col_name, '')
+        worksheet.cell(row=r_idx, column=detail_start_col).value = time_val
+        worksheet.cell(row=r_idx, column=detail_start_col + 1).value = first_pay_count
+        for c_idx, col_name in enumerate(detail_retention_cols, detail_start_col + 2):
+            if col_name in df_columns:
+                worksheet.cell(row=r_idx, column=c_idx).value = row.get(col_name, '')
+
+def _normalize_retention_columns(df):
+    """
+    规范留存相关列名：
+    - 将常见的日期列名别名统一为 '时间'
+    - 将 D7/第7日/7天/7日留存 等统一为 '7日'；D1/次日/1日 -> '次日'
+    """
+    cols = list(df.columns)
+    # 先去除列名中的首尾空格，并生成无空格的对照，处理诸如 '8 日' / '17 日'
+    df.columns = df.columns.map(lambda x: str(x).strip())
+    cols_no_space = {c: re.sub(r"\s+", "", str(c)) for c in df.columns}
+    # 如果无空格名不同，则先重命名为去空格版本，避免后续匹配失败
+    space_strip_map = {orig: no_space for orig, no_space in cols_no_space.items() if orig != no_space}
+    if space_strip_map:
+        df.rename(columns=space_strip_map, inplace=True)
+        cols = list(df.columns)
+    # 标准化日期列
+    if '时间' not in df.columns:
+        for alt in ['日期', '统计日期', 'day', 'date', 'Date']:
+            if alt in df.columns:
+                df.rename(columns={alt: '时间'}, inplace=True)
+                break
+
+    # 构建列名映射
+    col_map = {}
+    for c in cols:
+        cs = str(c).strip()
+        # 跳过已标准列
+        if cs in ['时间', '首充人数', '首次人数'] or ('日' in cs and cs.endswith('日')) or cs == '次日':
+            continue
+        # 匹配 Dn / 第n日 / n日 / n天 / n日留存 / Dn留存
+        m = re.match(r'^[Dd]?(?:第)?(\d{1,2})[日天]?', cs)
+        if m:
+            n = int(m.group(1))
+            if n == 1:
+                target = '次日'
+            elif 3 <= n <= 30:
+                target = f'{n}日'
+            else:
+                continue
+            col_map[c] = target
+            continue
+        # 处理明确英文 Dn 格式
+        m2 = re.match(r'^[Dd](\d{1,2})', cs)
+        if m2:
+            n = int(m2.group(1))
+            if n == 1:
+                target = '次日'
+            elif 3 <= n <= 30:
+                target = f'{n}日'
+            else:
+                continue
+            col_map[c] = target
+            continue
+        # 其它常见别名
+        if cs in ['次留', '次日留存', 'D1']:
+            col_map[c] = '次日'
+
+    if col_map:
+        df.rename(columns=col_map, inplace=True)
+
+    # 统一首充人数列名
+    if '首充人数' not in df.columns and '首次人数' in df.columns:
+        df.rename(columns={'首次人数': '首充人数'}, inplace=True)
+
+    return df
+
+def generate_retention_data(data_files):
+    # 改进：不使用sort_by_col，避免因列不存在导致的问题
+    df = process_cumulative_files(data_files, '时间')
+    if df is None or df.empty: 
+        print("  警告：留存率数据文件为空或无法读取")
+        return None
+
+    print(f"  找到留存率数据，共 {len(df)} 行")
+    print(f"  列名: {list(df.columns)}")
+
+    # 规范列名
+    df = _normalize_retention_columns(df)
+    if '时间' not in df.columns:
+        print("  错误：留存数据中缺少'时间'列")
+        return None
+
+    def extract_percentage(x):
+        if pd.isna(x) or x == '':
+            return ''
+        s = str(x)
+        match = re.search(r'(\d+\.?\d*%)', s)
+        if match:
+            return match.group(1)
+        return x
+    
+    # 处理包含'日'的列，提取百分比
+    for col in df.columns:
+        if '日' in str(col) and col not in ['时间']: 
+            df[col] = df[col].apply(extract_percentage)
+
+    # 处理可能的列名变体
+    if '首充人数' not in df.columns and '首次人数' in df.columns:
+        df.rename(columns={'首次人数': '首充人数'}, inplace=True)
+    elif '首充人数' not in df.columns and '首充' in df.columns:
+        # 如果只有'首充'列，尝试从中提取人数
+        df['首充人数'] = df['首充'].apply(lambda x: str(x).split('|')[1].strip() if '|' in str(x) else x)
+        
+    df = df.sort_values(by='时间').reset_index(drop=True)
+    df['时间'] = df['时间'].dt.strftime('%#d/%#m/%Y')
+    
+    print(f"  处理后的留存率数据形状: {df.shape}")
+    return df
+
+def generate_consumption_data(quality_files, rules):
+    if not quality_files: return None
+    try:
+        name_map = {rule['代码']: rule['名称'] for rule in rules}
+        
+        consumption_data = []
+        for file in quality_files:
+            basename = os.path.basename(file)
+            code_match = re.search(r'推广_(\d+)', basename)
+            date_match = re.search(r'(\d{4}-\d{2}-\d{2})', basename)
+            if not code_match or not date_match: continue
+            
+            channel_code = code_match.group(1).strip()
+            date_str = date_match.group(1)
+            
+            df_c = pd.read_csv(file, sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+            df_c.columns = df_c.columns.str.strip()
+            df_c = df_c[df_c['日期'] != '数据汇总']
+            if '当日消耗' in df_c.columns and not df_c.empty:
+                consumption = pd.to_numeric(df_c['当日消耗'].iloc[0], errors='coerce')
+                consumption_data.append({
+                    "日期": pd.to_datetime(date_str),
+                    "渠道名称": name_map.get(channel_code, f"未知_{channel_code}"),
+                    "当日消耗": consumption if pd.notna(consumption) else 0
+                })
+
+        if not consumption_data: return None
+        
+        final_df = pd.DataFrame(consumption_data)
+        agg_df = final_df.groupby(['日期', '渠道名称'])['当日消耗'].sum().reset_index()
+        pivoted = agg_df.pivot_table(index='日期', columns='渠道名称', values='当日消耗', aggfunc='sum').fillna(0)
+        return pivoted
+
+    except Exception as e:
+        print(f"  处理'消耗'sheet时出错: {e}")
+        return None
+
+def format_consumption_sheet(writer, df, rules):
+    workbook = writer.book
+    worksheet = workbook.create_sheet(title='消耗')
+    
+    # 基于命名规则动态归类：_333_ -> 短信；_111_ -> 投放；_222_ -> 网红；其他 -> 其他
+    def _category_from_channel_name(name: str) -> str:
+        s = str(name).upper()
+        if re.search(r'(^|_)333(_|$)', s):
+            return '短信'
+        if re.search(r'(^|_)111(_|$)', s):
+            return '投放'
+        if re.search(r'(^|_)222(_|$)', s):
+            return '网红'
+        return '其他'
+
+    header_structure = { '短信': [], '投放': [], '网红': [], '其他': [] }
+    # df 的列即渠道名称
+    for channel_name in list(df.columns):
+        cat = _category_from_channel_name(channel_name)
+        header_structure[cat].append(channel_name)
+
+    worksheet.cell(row=2, column=1).value = '总代号匹配'
+    worksheet.cell(row=2, column=2).value = '平台'
+    worksheet.cell(row=3, column=3).value = '日期'
+    worksheet.cell(row=3, column=4).value = '当日消耗($)'
+    
+    current_col = 5
+    channel_cols_map = {}
+    for category in ['短信', '投放', '网红', '其他']:
+        channels = header_structure.get(category, [])
+        if not channels: continue
+        start_col = current_col
+        worksheet.cell(row=2, column=start_col).value = category
+        for channel_name in channels:
+            worksheet.cell(row=3, column=current_col).value = channel_name
+            channel_cols_map[channel_name] = current_col
+            current_col += 1
+        if len(channels) > 1:
+            worksheet.merge_cells(start_row=2, start_column=start_col, end_row=2, end_column=current_col - 1)
+
+    channel_end_col = current_col - 1
+    total_consumption_col = current_col
+    check_col = current_col + 1
+    worksheet.cell(row=3, column=total_consumption_col).value = '渠道消耗'
+    worksheet.cell(row=3, column=check_col).value = '核对'
+
+    # 隐藏第一列（总代号匹配）
+    try:
+        worksheet.column_dimensions[get_column_letter(1)].hidden = True
+    except Exception:
+        pass
+
+    start_row = 4
+    end_row = start_row + len(df) - 1
+    
+    for r_idx, (date, row_data) in enumerate(df.iterrows(), start_row):
+        worksheet.cell(row=r_idx, column=2).value = CONFIG["PLATFORM_NAME"]
+        worksheet.cell(row=r_idx, column=3).value = date.strftime('%#d/%#m/%Y')
+        worksheet.cell(row=r_idx, column=4).value = f"=SUM({get_column_letter(5)}{r_idx}:{get_column_letter(channel_end_col)}{r_idx})"
+        
+        for channel_name, col_idx in channel_cols_map.items():
+            if channel_name in row_data:
+                worksheet.cell(row=r_idx, column=col_idx).value = row_data[channel_name]
+        
+        # 渠道消耗 = 当日消耗（用于核对显示 TRUE/FALSE）
+        worksheet.cell(row=r_idx, column=total_consumption_col).value = f"={get_column_letter(4)}{r_idx}"
+        worksheet.cell(row=r_idx, column=check_col).value = (
+            f"=IF(ROUND({get_column_letter(total_consumption_col)}{r_idx},2)="
+            f"ROUND({get_column_letter(4)}{r_idx},2),TRUE,FALSE)"
+        )
+
+    worksheet.cell(row=1, column=2).value = '和'
+    if start_row <= end_row:
+        # 顶部合计按列汇总（不包含布尔列“核对”）
+        for col_idx in range(4, total_consumption_col + 1):
+            col_letter = get_column_letter(col_idx)
+            worksheet.cell(row=1, column=col_idx).value = f"=SUM({col_letter}{start_row}:{col_letter}{end_row})"
+
+def generate_daily_channel_sheet(q_files, u_files, e_files):
+    if not all([q_files, u_files, e_files]):
+        return None
+        
+    file_groups = {}
+    all_files = q_files + u_files + e_files
+    for f in all_files:
+        match = re.search(r'(\(\d+\))', os.path.basename(f))
+        key = match.group(1) if match else os.path.basename(f)
+        
+        if key not in file_groups:
+            file_groups[key] = {}
+            
+        if '渠道质量' in f:
+            file_groups[key]['quality'] = f
+        elif '用户质量' in f:
+            file_groups[key]['user'] = f
+        elif '经济效益' in f:
+            file_groups[key]['economic'] = f
+
+    all_days_df = []
+    
+    for key in sorted(file_groups.keys()):
+        group = file_groups[key]
+        if 'quality' not in group or 'user' not in group or 'economic' not in group:
+            continue
+
+        try:
+            df_q = pd.read_csv(group['quality'])
+            df_u = pd.read_csv(group['user'])
+            df_e = pd.read_csv(group['economic'])
+            # 基础清洗：去首尾空格
+            for d in (df_q, df_u, df_e):
+                d.columns = d.columns.map(lambda x: str(x).strip())
+            # 统一常见别名，避免列名差异导致缺值
+            def _normalize_cols(d: pd.DataFrame) -> pd.DataFrame:
+                rename_map = {
+                    '老用户登录': '老用户登陆',
+                    '访问': '访问量',
+                    '新增': '新增用户',
+                    'ARPU值': 'ARPU',
+                    '当日消耗': '当日消耗($)',
+                    '当日消耗(USD)': '当日消耗($)',
+                    '当天消耗': '当日消耗($)',
+                }
+                for k, v in list(rename_map.items()):
+                    if k in d.columns and v not in d.columns:
+                        d.rename(columns={k: v}, inplace=True)
+                return d
+            df_q, df_u, df_e = _normalize_cols(df_q), _normalize_cols(df_u), _normalize_cols(df_e)
+            
+            # 从任一文件推断日期（优先 quality，其次 user，再次 economic）
+            report_date = None
+            for d in (df_q, df_u, df_e):
+                if '日期' in d.columns and not d['日期'].dropna().empty:
+                    first_valid_date = d['日期'].dropna().iloc[0]
+                    parsed = pd.to_datetime(first_valid_date, errors='coerce')
+                    if pd.notna(parsed):
+                        report_date = parsed.strftime('%#d/%#m/%Y')
+                        break
+            
+            df_q = df_q[~df_q['分组名称'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+            df_u = df_u[~df_u['分组名称'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+            df_e = df_e[~df_e['分组名称'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+
+            merged_df = pd.merge(df_q, df_u, on='分组名称', how='outer')
+            merged_df = pd.merge(merged_df, df_e, on='分组名称', how='outer')
+            
+            merged_df['日期'] = report_date if report_date else "未知日期"
+            all_days_df.append(merged_df)
+
+        except Exception as e:
+            print(f"处理文件组 {key} 时出错: {e}")
+            continue
+            
+    if not all_days_df:
+        return None
+        
+    final_df = pd.concat(all_days_df, ignore_index=True)
+
+    def parse_group_info(group_name):
+        code_to_category_map = {rule['代码']: rule['分类'] for rule in CHANNEL_RULES}
+        code, name, category, delivery_method = '', '', '', ''
+        try:
+            parts = str(group_name).strip().split(' / ')
+            if len(parts) >= 2:
+                code, name = parts[0].strip(), parts[1].strip()
+                category = code_to_category_map.get(code, '其他')
+                if 'ORGANIC' in name.upper():
+                    category = '自然量'
+                    delivery_method = 'ORGANIC'
+                elif '_' in name:
+                    delivery_method = name.split('_')[-1]
+            elif len(parts) == 1:
+                name = parts[0].strip()
+                if 'ORGANIC' in name.upper():
+                    category = '自然量'
+                    delivery_method = 'ORGANIC'
+        except Exception: pass
+        return code, name, category, delivery_method
+
+    parsed_info = final_df['分组名称'].apply(lambda x: pd.Series(parse_group_info(x), index=['总代号', '总代名', '方式', '投放方式']))
+    final_df = pd.concat([final_df, parsed_info], axis=1)
+
+    def parse_composite_column(series, part_index):
+        if series.empty or series.dropna().empty: return pd.Series([0] * len(series), index=series.index)
+        temp_df = series.astype(str).str.split(r'\s*\|\s*', expand=True)
+        if part_index < len(temp_df.columns):
+            return pd.to_numeric(temp_df[part_index], errors='coerce').fillna(0)
+        return pd.Series([0] * len(series), index=series.index)
+
+    final_df['一级首充人数'] = parse_composite_column(final_df.get('一级首充'), 1)
+    final_df['首充金额'] = parse_composite_column(final_df.get('首充'), 0)
+    final_df['首充人数'] = parse_composite_column(final_df.get('首充'), 1)
+    final_df['非首充充值金额'] = parse_composite_column(final_df.get('非首充'), 0)
+    final_df['非首充人数'] = parse_composite_column(final_df.get('非首充'), 1)
+    
+    final_df.rename(columns={'首充': '首充（首充人均）','非首充': '非首充（老用户人均）','新增充值': '新增充值（充值人均)','总收入': '充值金額'}, inplace=True)
+    
+    output_columns = ['日期', '总代号', '总代名', '方式', '投放方式', '一级首充人数', '首充金额', '首充人数', '非首充充值金额', '非首充人数', '分组名称', '当日消耗($)', '访问量', '新增用户', '老用户登陆', '活跃', '新增成本', '首充付费人数', '付费/首充成本', '注册复登', '首充复登', '首充复充', '首充（首充人均）', '一级首充', '非首充（老用户人均）', '新增充值（充值人均)', '一级新充', '裂变占比', '新增/首充率', '老用户充值', '活跃充值', '提现人数', '提现金额', '提现率', '首充提现率(人数)', '首充提现率(金额)', '老用户付费率', '老用户付费占比', '活跃付费率', 'ARPU', '充值金額', '总提现', '充提差', '新增充值ROAS', '老用户充值ROAS', '总充值ROI', '当日回本ROI']
+    
+    for col in output_columns:
+        if col not in final_df.columns:
+            final_df[col] = ''
+            
+    return final_df[output_columns]
+
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_excel_filename = os.path.join(script_dir, CONFIG["OUTPUT_FILENAME"])
+    
+    def find_files(pattern):
+        files = glob.glob(os.path.join(script_dir, pattern))
+        print(f"查找 '{pattern}': 找到了 {len(files)} 个文件。")
+        return files
+
+    backend_files = find_files("download_ops_*.csv")
+    channel_quality_files = find_files("推广渠道统计-渠道质量*.csv")
+    user_quality_files = find_files("推广渠道统计-用户质量*.csv")
+    economic_files = find_files("推广渠道统计-经济效益*.csv")
+    login_return_files = find_files("download_first_login_return_全平台_*.csv")
+    recharge_return_files = find_files("download_first_recharge_return_全平台_*.csv")
+    
+    # 添加更多可能的文件模式
+    if not login_return_files:
+        login_return_files = find_files("*login_return*.csv")
+    if not recharge_return_files:
+        recharge_return_files = find_files("*recharge_return*.csv")
+    
+    print(f"留存率相关文件:")
+    print(f"  - 登录留存文件: {len(login_return_files)} 个")
+    print(f"  - 充值留存文件: {len(recharge_return_files)} 个")
+
+    # 只保留包含留存列的文件
+    def _file_has_retention_cols(fp):
+        try:
+            tmp = pd.read_csv(fp, nrows=1, engine='python', on_bad_lines='skip', encoding='utf-8')
+            tmp.columns = tmp.columns.str.strip()
+            # 临时复制规范化逻辑检查是否存在任一留存列
+            cols = set(tmp.columns)
+            if '时间' not in cols and '日期' not in cols:
+                return False
+            # 直接看是否有包含“日”或常见 Dn/次日 的列
+            for c in cols:
+                cs = str(c)
+                if cs == '次日' or ('日' in cs and any(ch.isdigit() for ch in cs)) or re.match(r'^[Dd](\d+)', cs):
+                    return True
+            return False
+        except Exception:
+            return False
+
+    login_return_files = [f for f in login_return_files if _file_has_retention_cols(f)]
+    recharge_return_files = [f for f in recharge_return_files if _file_has_retention_cols(f)]
+    print(f"  - 过滤后 登录留存文件: {len(login_return_files)} 个")
+    print(f"  - 过滤后 充值留存文件: {len(recharge_return_files)} 个")
+    
+    all_promo_files = find_files("推广_*.csv")
+    consumption_files = [f for f in all_promo_files if '渠道质量' in os.path.basename(f)]
+    print(f"  - 筛选后，用于'消耗'sheet的'渠道质量'文件: {len(consumption_files)} 个")
+    
+    daily_q_files = find_files("每日渠道统计-渠道质量*.csv")
+    daily_u_files = find_files("每日渠道统计-用户质量*.csv")
+    daily_e_files = find_files("每日渠道统计-经济效益*.csv")
+
+    # 渠道留存文件（按总代号分组）
+    channel_login_files = find_files("download_first_login_return_*_*.csv")
+    channel_recharge_files = find_files("download_first_recharge_return_*_*.csv")
+    print(f"渠道留存文件:")
+    print(f"  - 渠道登录留存: {len(channel_login_files)} 个")
+    print(f"  - 渠道充值留存: {len(channel_recharge_files)} 个")
+
+    print("\n--- 开始写入Excel文件 ---")
+    
+    if os.path.exists(output_excel_filename):
+        try:
+            os.remove(output_excel_filename)
+        except PermissionError:
+            print(f"\n错误：无法删除旧的报表文件 '{output_excel_filename}'。")
+            print("请先手动关闭这个Excel文件，然后重新运行脚本。")
+            return
+            
+    pd.DataFrame().to_excel(output_excel_filename)
+
+    with pd.ExcelWriter(output_excel_filename, engine='openpyxl') as writer:
+        
+        print("\n正在处理 '后台' sheet...")
+        if (backend_data := generate_backend_sheet(backend_files)) is not None and not backend_data.empty:
+            backend_data.to_excel(writer, sheet_name='后台', index=False)
+            print("- '后台' sheet 已写入。")
+
+        print("\n正在处理 '推广渠道统计' sheet...")
+        if (channel_data := generate_channel_sheet(channel_quality_files, user_quality_files, economic_files)) is not None and not channel_data.empty:
+            channel_data.to_excel(writer, sheet_name='推广渠道统计', index=False)
+            print("- '推广渠道统计' sheet 已写入。")
+        
+        print("\n正在处理 '首充复登' sheet...")
+        if (login_data := generate_retention_data(login_return_files)) is not None and not login_data.empty:
+            summary_cols_login = ['次日', '3日', '4日', '5日', '6日', '7日']
+            format_retention_sheet(writer, login_data, '首充复登', summary_cols_login)
+            print("- '首充复登' sheet 已写入并格式化。")
+
+        print("\n正在处理 '首充复充' sheet...")
+        if (recharge_data := generate_retention_data(recharge_return_files)) is not None and not recharge_data.empty:
+            summary_cols_recharge = ['次日', '3日', '4日', '5日', '6日', '7日', '30日']
+            format_retention_sheet(writer, recharge_data, '首充复充', summary_cols_recharge)
+            print("- '首充复充' sheet 已写入并格式化。")
+            
+        print("\n正在处理 '消耗' sheet...")
+        if (consumption_data := generate_consumption_data(consumption_files, CHANNEL_RULES)) is not None and not consumption_data.empty:
+            format_consumption_sheet(writer, consumption_data, CHANNEL_RULES)
+            print("- '消耗' sheet 已写入并格式化。")
+
+        print("\n正在处理 '每日渠道消耗' sheet...")
+        def format_daily_channel_sheet(writer, df):
+            workbook = writer.book
+            ws = workbook.create_sheet(title='每日渠道消耗')
+            headers = ['日期', '总代号', '总代名', '方式', '投放方式', '一级首充人数', '首充金额', '首充人数', '非首充充值金额', '非首充人数', '分组名称', '当日消耗($)', '访问量', '新增用户', '老用户登陆', '活跃', '新增成本', '首充付费人数', '付费/首充成本', '注册复登', '首充复登', '首充复充', '分组名称', '首充（首充人均）', '一级首充', '非首充（老用户人均）', '新增充值（充值人均)', '一级新充', '裂变占比', '新增/首充率', '老用户充值', '活跃充值', '提现人数', '提现金额', '提现率', '首充提现率(人数)', '首充提现率(金额)', '老用户付费率', '老用户付费占比', '活跃付费率', 'ARPU', '分组名称', '充值金額', '总提现', '充提差', '新增充值ROAS', '老用户充值ROAS', '总充值ROI', '当日回本ROI']
+            for c_idx, h in enumerate(headers, 1):
+                ws.cell(row=1, column=c_idx).value = h
+
+            # 目标列索引（1-based）
+            col_idx_map = {name: headers.index(name) + 1 for name in headers}
+
+            # 获取引用列位置（后部原始列）
+            col_group_name = col_idx_map['分组名称']  # 第一个分组名称位置
+            col_first_charge = col_idx_map['首充（首充人均）']
+            col_first_charge_lv1 = col_idx_map['一级首充']
+            col_non_first = col_idx_map['非首充（老用户人均）']
+
+            start_row = 2
+            for r_offset, (_, row) in enumerate(df.iterrows(), 0):
+                r = start_row + r_offset
+                # 日期：若缺失，默认次日
+                date_val = row.get('日期')
+                if not isinstance(date_val, str) or not date_val:
+                    date_val = (datetime.today() + timedelta(days=1)).strftime('%#d/%#m/%Y')
+                ws.cell(row=r, column=col_idx_map['日期']).value = date_val
+                # 直接写入的字段（解析自分组名称的列）
+                ws.cell(row=r, column=col_idx_map['总代号']).value = row.get('总代号', '')
+                ws.cell(row=r, column=col_idx_map['总代名']).value = row.get('总代名', '')
+                ws.cell(row=r, column=col_idx_map['方式']).value = row.get('方式', '')
+                ws.cell(row=r, column=col_idx_map['投放方式']).value = row.get('投放方式', '')
+
+                # A-J 中 F-J 用公式从后面的复合字段中提取
+                # 提取金额（左半部分）与人数（右半部分），分隔符包含 '|'
+                def left_amount_formula(col_letter):
+                    # 若包含“|”则取左侧金额，否则若可转数值则取数，否则留空
+                    return (
+                        f"=IFERROR(IF(ISNUMBER(SEARCH(\"|\",{col_letter}{r})),"
+                        f"VALUE(TRIM(LEFT({col_letter}{r},SEARCH(\"|\",{col_letter}{r})-1))),"
+                        f"IFERROR(VALUE(TRIM({col_letter}{r})),\"\")),\"\")"
+                    )
+                def right_count_formula(col_letter):
+                    # 若包含“|”则取右侧人数，否则留空；出错留空
+                    return (
+                        f"=IFERROR(IF(ISNUMBER(SEARCH(\"|\",{col_letter}{r})),"
+                        f"VALUE(TRIM(MID({col_letter}{r},SEARCH(\"|\",{col_letter}{r})+1,99))),\"\"),\"\")"
+                    )
+
+                # 列字母
+                def letter(col_index):
+                    return get_column_letter(col_index)
+
+                # 优先写入已解析好的数值列；若不存在则使用公式从复合列拆分
+                def set_value_or_formula(col_name, value_series_key, formula):
+                    val = row.get(value_series_key, None)
+                    if val is not None and val != '' and not (isinstance(val, float) and pd.isna(val)):
+                        ws.cell(row=r, column=col_idx_map[col_name]).value = val
+                    else:
+                        ws.cell(row=r, column=col_idx_map[col_name]).value = formula
+
+                set_value_or_formula('一级首充人数', '一级首充人数', right_count_formula(letter(col_first_charge_lv1)))
+                set_value_or_formula('首充金额', '首充金额', left_amount_formula(letter(col_first_charge)))
+                set_value_or_formula('首充人数', '首充人数', right_count_formula(letter(col_first_charge)))
+                set_value_or_formula('非首充充值金额', '非首充充值金额', left_amount_formula(letter(col_non_first)))
+                set_value_or_formula('非首充人数', '非首充人数', right_count_formula(letter(col_non_first)))
+
+                # 剩余列直接写值
+                for name in headers[10:]:
+                    ws.cell(row=r, column=col_idx_map[name]).value = row.get(name, '')
+
+        daily_channel_data = generate_daily_channel_sheet(daily_q_files, daily_u_files, daily_e_files)
+        if daily_channel_data is not None and not daily_channel_data.empty:
+            format_daily_channel_sheet(writer, daily_channel_data)
+            print("- '每日渠道消耗' sheet 已写入并格式化。")
+        
+        # 渠道首充复登
+        print("\n正在处理 '渠道首充复登' sheet...")
+        def format_channel_retention_sheet(writer, files, sheet_name, summary_days):
+            workbook = writer.book
+            ws = workbook.create_sheet(title=sheet_name)
+            
+            # 按截图格式设置表头
+            # 第一行：时间、首充人数、留存率（合并到7日）、方式、总代号、时间、首充人数、留存率（合并到30日）
+            ws.cell(row=1, column=1).value = '时间'
+            ws.cell(row=1, column=2).value = '首充人数'
+            ws.merge_cells(start_row=1, start_column=3, end_row=1, end_column=6)  # 留存率合并到7日
+            ws.cell(row=1, column=3).value = '留存率'
+            ws.cell(row=1, column=7).value = '方式'
+            ws.cell(row=1, column=8).value = '总代号'
+            ws.cell(row=1, column=9).value = '时间'
+            ws.cell(row=1, column=10).value = '首充人数'
+            ws.merge_cells(start_row=1, start_column=11, end_row=1, end_column=17)  # 留存率合并到30日
+            ws.cell(row=1, column=11).value = '留存率'
+            
+            # 第二行：具体列名
+            # 左侧：时间、首充人数、次日、3日、7日、30日、方式、总代号
+            # 右侧：时间、首充人数、次日、3日、4日、5日、6日、7日、30日
+            left_headers = ['时间', '首充人数', '次日', '3日', '7日', '30日', '方式', '总代号']
+            right_headers = ['时间', '首充人数', '次日', '3日', '4日', '5日', '6日', '7日', '30日']
+            
+            for i, h in enumerate(left_headers, 1):
+                ws.cell(row=2, column=i).value = h
+            for i, h in enumerate(right_headers, 9):
+                ws.cell(row=2, column=i).value = h
+
+            # 按总代号分组处理文件
+            agent_groups = {}
+            for fp in files:
+                try:
+                    basename = os.path.basename(fp)
+                    print(f"  处理文件: {basename}")
+                    # 提取总代号：download_first_login_return_1102 _ TL_333_XXX_AAA_DP_本月_2025-10-16
+                    m = re.search(r'download_first_(?:login|recharge)_return_(\d+)\s*_', basename)
+                    if not m:
+                        print(f"    跳过文件（无法提取总代号）: {basename}")
+                        continue
+                    agent_code = m.group(1)
+                    if agent_code not in agent_groups:
+                        agent_groups[agent_code] = []
+                    agent_groups[agent_code].append(fp)
+                    print(f"    总代号: {agent_code}")
+                except Exception as e:
+                    print(f"    处理文件出错: {e}")
+                    continue
+            
+            print(f"  找到 {len(agent_groups)} 个总代号组")
+
+            # 从CHANNEL_RULES获取总代名、方式、投放方式
+            code_to_info = {rule['代码']: rule for rule in CHANNEL_RULES}
+
+            row = 3
+            for agent_code in sorted(agent_groups.keys()):
+                agent_files = agent_groups[agent_code]
+                info = code_to_info.get(agent_code, {})
+                agent_name = info.get('名称', f'未知_{agent_code}')
+                method = info.get('分类', '其他')
+
+                # 合并该总代号的所有文件
+                try:
+                    dfs = []
+                    for fp in agent_files:
+                        df = pd.read_csv(fp, engine='python', on_bad_lines='skip', encoding='utf-8')
+                        df.columns = df.columns.str.strip()
+                        # 过滤掉汇总行
+                        df = df[~df['时间'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+                        df['时间'] = pd.to_datetime(df['时间'], errors='coerce')
+                        df.dropna(subset=['时间'], inplace=True)
+                        if not df.empty:
+                            dfs.append(df)
+                    if not dfs:
+                        continue
+                    merged = pd.concat(dfs, ignore_index=True)
+                    # 按日期去重，保留最后一条
+                    merged = merged.sort_values('时间').drop_duplicates(subset=['时间'], keep='last')
+                    merged = merged.sort_values('时间')
+
+                    # 写入数据行
+                    for _, r in merged.iterrows():
+                        date_str = r['时间'].strftime('%#d/%#m/%Y') if hasattr(r['时间'], 'strftime') else str(r['时间'])
+                        
+                        # 左侧汇总部分
+                        ws.cell(row=row, column=1).value = date_str
+                        ws.cell(row=row, column=2).value = r.get('首充人数', '')
+                        ws.cell(row=row, column=7).value = method
+                        ws.cell(row=row, column=8).value = agent_code
+                        
+                        # 右侧详细部分
+                        ws.cell(row=row, column=9).value = date_str
+                        ws.cell(row=row, column=10).value = r.get('首充人数', '')
+
+                        # 直接从数据中提取百分比（从"百分比 / 人数"格式中提取百分比部分）
+                        def extract_percent_from_data(col_name):
+                            if col_name in r and pd.notna(r[col_name]):
+                                val = str(r[col_name]).strip()
+                                if '/' in val:
+                                    return val.split('/')[0].strip()
+                                return val
+                            return ""
+
+                        # 左侧汇总列（3-6列：次日、3日、7日、30日）
+                        summary_cols = ['次日', '3日', '7日', '30日']
+                        for i, col_name in enumerate(summary_cols, 3):
+                            percent_val = extract_percent_from_data(col_name)
+                            if percent_val:
+                                ws.cell(row=row, column=i).value = percent_val
+
+                        # 右侧详细列（11-17列：次日、3日、4日、5日、6日、7日、30日）
+                        detail_cols = ['次日', '3日', '4日', '5日', '6日', '7日', '30日']
+                        for i, col_name in enumerate(detail_cols, 11):
+                            percent_val = extract_percent_from_data(col_name)
+                            if percent_val:
+                                ws.cell(row=row, column=i).value = percent_val
+                        
+                        row += 1
+                except Exception as e:
+                    print(f"处理总代号 {agent_code} 时出错: {e}")
+                    continue
+
+        if channel_login_files:
+            format_channel_retention_sheet(writer, channel_login_files, '渠道首充复登', ['次日', '3日', '7日', '30日'])
+            print("- '渠道首充复登' sheet 已写入并格式化。")
+
+        # 渠道首充复充
+        print("\n正在处理 '渠道首充复充' sheet...")
+        if channel_recharge_files:
+            format_channel_retention_sheet(writer, channel_recharge_files, '渠道首充复充', ['次日', '3日', '7日', '30日'])
+            print("- '渠道首充复充' sheet 已写入并格式化。")
+        
+        # LTV相关文件
+        ltv_files = find_files("download_ltv_*.csv")
+        print(f"LTV文件:")
+        print(f"  - 找到 {len(ltv_files)} 个LTV文件")
+        
+        # 按渠道分类LTV文件
+        ltv_platform_files = [f for f in ltv_files if '全平台' in f]
+        ltv_channel_files = [f for f in ltv_files if '全平台' not in f]
+        
+        # 按渠道类型分类（根据文件名中的映射代码）
+        sms_ltv_files = []
+        influencer_ltv_files = []
+        ad_ltv_files = []
+        
+        for f in ltv_channel_files:
+            basename = os.path.basename(f)
+            # 根据映射规则分类：333=短信，222=网红，111=投放
+            # 只处理LTV文件
+            if 'download_ltv_' in basename:
+                if '_333_' in basename:  # 短信群发类
+                    sms_ltv_files.append(f)
+                    print(f"    短信LTV文件: {basename}")
+                elif '_222_' in basename:  # 网红
+                    influencer_ltv_files.append(f)
+                    print(f"    网红LTV文件: {basename}")
+                elif '_111_' in basename:  # 投放
+                    ad_ltv_files.append(f)
+                    print(f"    投放LTV文件: {basename}")
+        
+        print(f"  - 全平台LTV: {len(ltv_platform_files)} 个")
+        print(f"  - 短信LTV: {len(sms_ltv_files)} 个")
+        print(f"  - 网红LTV: {len(influencer_ltv_files)} 个")
+        print(f"  - 投放LTV: {len(ad_ltv_files)} 个")
+        
+        # 详细列出每个分类的文件
+        print("  短信LTV文件列表:")
+        for f in sms_ltv_files:
+            print(f"    {os.path.basename(f)}")
+        print("  网红LTV文件列表:")
+        for f in influencer_ltv_files:
+            print(f"    {os.path.basename(f)}")
+        print("  投放LTV文件列表:")
+        for f in ad_ltv_files:
+            print(f"    {os.path.basename(f)}")
+        
+        # LTV表处理函数
+        def format_ltv_sheet(writer, files, sheet_name, is_platform=False):
+            workbook = writer.book
+            ws = workbook.create_sheet(title=sheet_name)
+            
+            if is_platform:
+                # 全平台LTV表头
+                headers = ['14日辅助列', '30日辅助列', '时间', '消耗', '新增用户', '新增用户单价', '首充人数', 
+                          '14日LTV', '', '30日LTV', '', '60日LTV', '']
+                sub_headers = ['', '', '', '', '', '', '', '金额', '付费用户数', '金额', '付费用户数', '金额', '付费用户数']
+            else:
+                # 渠道LTV表头
+                headers = ['14日辅助列', '30日辅助列', '时间', '消耗', '新增用户', '新增用户单价', '首充人数', 
+                          '付费率', '注册复登', '首充复登', '3日注册复登', '3日首充复登', '首充成本',
+                          '首日LTV', '', '2日LTV', '', '3日LTV', '', '7日LTV', '', '14日LTV', '', '30日LTV', '', '60日LTV', '']
+                sub_headers = ['', '', '', '', '', '', '', '', '', '', '', '', '', 
+                              '金额', '付费用户数', '金额', '付费用户数', '金额', '付费用户数', '金额', '', '金额', '付费用户数', '金额', '付费用户数', '金额', '付费用户数']
+            
+            # 写入表头
+            for i, h in enumerate(headers, 1):
+                ws.cell(row=1, column=i).value = h
+            for i, h in enumerate(sub_headers, 1):
+                ws.cell(row=2, column=i).value = h
+            
+            # 合并单元格
+            if is_platform:
+                ws.merge_cells(start_row=1, start_column=8, end_row=1, end_column=9)   # 14日LTV
+                ws.merge_cells(start_row=1, start_column=10, end_row=1, end_column=11)  # 30日LTV
+                ws.merge_cells(start_row=1, start_column=12, end_row=1, end_column=13)  # 60日LTV
+            else:
+                # 渠道LTV合并单元格
+                ltv_columns = [(14, 15), (16, 17), (18, 19), (20, 21), (22, 23), (24, 25), (26, 27)]
+                for start_col, end_col in ltv_columns:
+                    ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
+            
+            if not files:
+                return
+            
+            # 处理数据
+            all_data = []
+            print(f"    开始处理 {len(files)} 个文件...")
+            for i, fp in enumerate(files):
+                try:
+                    basename = os.path.basename(fp)
+                    df = pd.read_csv(fp, engine='python', on_bad_lines='skip', encoding='utf-8')
+                    df.columns = df.columns.str.strip()
+                    print(f"    文件{i+1}: {basename}")
+                    print(f"      列名: {list(df.columns)}")
+                    # 过滤掉汇总行
+                    df = df[~df['时间'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+                    df['时间'] = pd.to_datetime(df['时间'], errors='coerce')
+                    df.dropna(subset=['时间'], inplace=True)
+                    if not df.empty:
+                        # 检查消耗列的数据
+                        if '消耗' in df.columns:
+                            print(f"      消耗列示例数据: {df['消耗'].head(3).tolist()}")
+                        all_data.append(df)
+                        print(f"      有效数据行数: {len(df)}")
+                except Exception as e:
+                    print(f"    读取LTV文件出错: {e}")
+                    continue
+            
+            if not all_data:
+                return
+            
+            # 对于渠道LTV，需要按日期汇总数据，而不是简单合并
+            if is_platform:
+                merged = pd.concat(all_data, ignore_index=True)
+                merged = merged.sort_values('时间').drop_duplicates(subset=['时间'], keep='last')
+                merged = merged.sort_values('时间')
+            else:
+                # 渠道LTV：按日期汇总所有渠道的数据
+                merged = pd.concat(all_data, ignore_index=True)
+                
+                # 只对LTV相关的数值列进行汇总，保留其他字段
+                ltv_numeric_cols = ['金额', '付费用户数', '金额.1', '付费用户数.1', 
+                                   '金额.2', '付费用户数.2', '金额.3', '金额.4', '付费用户数.3', 
+                                   '金额.5', '付费用户数.4', '金额.6', '付费用户数.5']
+                
+                # 确保LTV数值列是数值类型
+                for col in ltv_numeric_cols:
+                    if col in merged.columns:
+                        merged[col] = pd.to_numeric(merged[col], errors='coerce').fillna(0)
+                
+                # 先处理消耗列，去除$符号并转换为数值
+                if '消耗' in merged.columns:
+                    merged['消耗'] = pd.to_numeric(merged['消耗'].astype(str).str.replace('$', ''), errors='coerce').fillna(0)
+                if '新增用户' in merged.columns:
+                    merged['新增用户'] = pd.to_numeric(merged['新增用户'], errors='coerce').fillna(0)
+                if '首充人数' in merged.columns:
+                    merged['首充人数'] = pd.to_numeric(merged['首充人数'], errors='coerce').fillna(0)
+                
+                # 按日期分组，对LTV数值列求和，其他列取第一个值
+                agg_dict = {}
+                for col in merged.columns:
+                    if col == '时间':
+                        continue
+                    elif col in ltv_numeric_cols:
+                        agg_dict[col] = 'sum'
+                    elif col in ['消耗', '新增用户', '首充人数']:
+                        agg_dict[col] = 'sum'
+                    else:
+                        agg_dict[col] = 'first'
+                
+                # print(f"    汇总前数据行数: {len(merged)}")
+                # print(f"    消耗列示例数据: {merged['消耗'].head(3).tolist()}")
+                
+                merged = merged.groupby('时间').agg(agg_dict).reset_index()
+                merged = merged.sort_values('时间')
+                
+                # print(f"    汇总后数据行数: {len(merged)}")
+                # print(f"    汇总后消耗列示例: {merged['消耗'].head(3).tolist()}")
+            
+            # 写入数据
+            row = 3
+            # print(f"    开始写入数据，共{len(merged)}行")
+            for idx, (_, r) in enumerate(merged.iterrows()):
+                date_str = r['时间'].strftime('%#d/%#m/%Y') if hasattr(r['时间'], 'strftime') else str(r['时间'])
+                # if idx < 3:  # 只打印前3行的调试信息
+                #     print(f"    第{idx+1}行数据: 日期={date_str}, 消耗={r.get('消耗', '')}")
+                
+                # 基础字段
+                ws.cell(row=row, column=3).value = date_str
+                ws.cell(row=row, column=4).value = r.get('消耗', '')
+                ws.cell(row=row, column=5).value = r.get('新增用户', '')
+                ws.cell(row=row, column=6).value = r.get('新增用户单价', '')
+                ws.cell(row=row, column=7).value = r.get('首充人数', '')
+                
+                if not is_platform:
+                    # 渠道特有字段
+                    ws.cell(row=row, column=8).value = r.get('付费率', '')
+                    ws.cell(row=row, column=9).value = r.get('注册复登', '')
+                    ws.cell(row=row, column=10).value = r.get('首充复登', '')
+                    ws.cell(row=row, column=11).value = r.get('3日注册复登', '')
+                    ws.cell(row=row, column=12).value = r.get('3日首充复登', '')
+                    ws.cell(row=row, column=13).value = r.get('首充成本', '')
+                
+                # LTV数据提取
+                def extract_ltv_data(col_name, amount_col, user_col):
+                    # 根据实际的CSV列名映射（从终端输出看到的真实列名）
+                    col_mapping = {
+                        '首日': ('金额', '付费用户数'),           # 第11,12列
+                        '2日': ('金额.1', '付费用户数.1'),        # 第13,14列  
+                        '3日': ('金额.2', '付费用户数.2'),        # 第15,16列
+                        '7日': ('金额.3', 'Unnamed: 18'),        # 第17,18列
+                        '14日': ('金额.4', '付费用户数.3'),       # 第19,20列
+                        '30日': ('金额.5', '付费用户数.4'),       # 第21,22列
+                        '60日': ('金额.6', '付费用户数.5')        # 第23,24列
+                    }
+                    
+                    if col_name in col_mapping:
+                        amount_col_name, user_col_name = col_mapping[col_name]
+                        
+                        # 获取原始值
+                        amount_val = r.get(amount_col_name, '') if amount_col_name in r else ''
+                        user_val = r.get(user_col_name, '') if user_col_name in r else ''
+                        
+                        # 转换为字符串并清理
+                        amount_str = str(amount_val).strip() if amount_val is not None else ''
+                        user_str = str(user_val).strip() if user_val is not None else ''
+                        
+                        if row == 3:  # 调试信息
+                            print(f"    {col_name}LTV: 查找列={amount_col_name},{user_col_name}, 金额={amount_str}, 用户数={user_str}")
+                        
+                        return amount_str, user_str
+                    return "", ""
+                
+                if is_platform:
+                    # 全平台LTV：14日、30日、60日
+                    ltv_days = [('14日', 8, 9), ('30日', 10, 11), ('60日', 12, 13)]
+                    for ltv_name, amount_col, user_col in ltv_days:
+                        amount, users = extract_ltv_data(ltv_name, amount_col, user_col)
+                        # if row == 3:  # 只打印第一行的调试信息
+                        #     print(f"    {ltv_name}LTV: 金额={amount}, 用户数={users}")
+                        ws.cell(row=row, column=amount_col).value = amount
+                        ws.cell(row=row, column=user_col).value = users
+                else:
+                    # 渠道LTV：首日、2日、3日、7日、14日、30日、60日
+                    ltv_days = [('首日', 14, 15), ('2日', 16, 17), ('3日', 18, 19), 
+                               ('7日', 20, 21), ('14日', 22, 23), ('30日', 24, 25), ('60日', 26, 27)]
+                    for ltv_name, amount_col, user_col in ltv_days:
+                        amount, users = extract_ltv_data(ltv_name, amount_col, user_col)
+                        # if row == 3:  # 只打印第一行的调试信息
+                        #     print(f"    {ltv_name}LTV: 金额={amount}, 用户数={users}")
+                        ws.cell(row=row, column=amount_col).value = amount
+                        ws.cell(row=row, column=user_col).value = users
+                
+                row += 1
+            
+            # 添加辅助列公式
+            if is_platform:
+                # 全平台LTV辅助列公式
+                ws.cell(row=1, column=1).value = "=SUM(A3:A9990)/SUMIFS(G3:G9990,W3:W9990,\"<>\")"  # 14日辅助列
+                ws.cell(row=1, column=2).value = "=SUM(B3:B9990)/SUMIFS(G3:G9990,Y3:Y9990,\"<>\")"  # 30日辅助列
+            else:
+                # 渠道LTV辅助列公式
+                ws.cell(row=1, column=1).value = "=SUM(A3:A10000)/SUMIFS(G3:G10000,W3:W10000,\"<>\")"  # 14日辅助列
+                ws.cell(row=1, column=2).value = "=SUM(B3:B10000)/SUMIFS(G3:G10000,Y3:Y10000,\"<>\")"  # 30日辅助列
+        
+        # 处理各个LTV表
+        if ltv_platform_files:
+            print("\n正在处理 'LTV' sheet...")
+            format_ltv_sheet(writer, ltv_platform_files, 'LTV', is_platform=True)
+            print("- 'LTV' sheet 已写入并格式化。")
+        
+        if sms_ltv_files:
+            print("\n正在处理 '短信LTV' sheet...")
+            format_ltv_sheet(writer, sms_ltv_files, '短信LTV', is_platform=False)
+            print("- '短信LTV' sheet 已写入并格式化。")
+        
+        if influencer_ltv_files:
+            print("\n正在处理 '网红LTV' sheet...")
+            format_ltv_sheet(writer, influencer_ltv_files, '网红LTV', is_platform=False)
+            print("- '网红LTV' sheet 已写入并格式化。")
+        
+        if ad_ltv_files:
+            print("\n正在处理 '投放LTV' sheet...")
+            format_ltv_sheet(writer, ad_ltv_files, '投放LTV', is_platform=False)
+            print("- '投放LTV' sheet 已写入并格式化。")
+        
+        if 'Sheet1' in writer.book.sheetnames:
+            writer.book.remove(writer.book['Sheet1'])
+            
+    print(f"\n--- 全部处理完成！---")
+    print(f"已成功生成或更新文件: '{os.path.basename(output_excel_filename)}'")
+
+if __name__ == "__main__":
+    main()
