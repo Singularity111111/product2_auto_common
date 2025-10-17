@@ -1,9 +1,13 @@
+# -*- coding: utf-8 -*-
 import pandas as pd
 import glob
 import os
 import re
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import Alignment
+from openpyxl.styles import Alignment, PatternFill, Font
+from openpyxl.formatting.rule import DataBarRule, ColorScaleRule
+from openpyxl.chart import BarChart, Reference, LineChart
+from openpyxl.chart.axis import DateAxis
 from datetime import datetime, timedelta
 
 # --- 1. 配置区 ---
@@ -39,10 +43,10 @@ CHANNEL_RULES = [
 # --- 3. Sheet生成与格式化函数 ---
 
 # <--- 此函数已被重写，以解决核心逻辑问题
-def process_cumulative_files(files, date_col_name, sort_by_col=None):
+def process_cumulative_files(files, date_col_name, sort_by_col=None, existing_data=None, is_incremental=False):
     """
     一个更健壮的函数，用于处理随时间累积的报表文件。
-    它会合并所有文件，然后智能地排序，以确保每个日期都保留数据最完整的那一行。
+    支持增量更新模式：保留历史数据，只处理新数据。
     """
     if not files: 
         print(f"  警告：没有找到文件")
@@ -66,6 +70,18 @@ def process_cumulative_files(files, date_col_name, sort_by_col=None):
         if df.empty:
             print(f"  警告：过滤后数据为空")
             return None
+        
+        # 增量更新逻辑：如果是增量模式且有现有数据，只保留新数据
+        if is_incremental and existing_data:
+            df['时间_str'] = df[date_col_name].astype(str)
+            # 只保留不在现有数据中的新日期
+            new_data = df[~df['时间_str'].isin(existing_data)]
+            if len(new_data) > 0:
+                print(f"  发现 {len(new_data)} 行新数据（增量更新）")
+                df = new_data.drop('时间_str', axis=1)
+            else:
+                print(f"  无新数据，跳过此文件组")
+                return None
 
         # 核心逻辑：在去重前，先按日期和数据完整性排序
         # 如果指定了 sort_by_col，则按其排序；否则自动计算“留存列的完整度”
@@ -102,9 +118,9 @@ def process_cumulative_files(files, date_col_name, sort_by_col=None):
         return None
 
 
-def generate_backend_sheet(data_files):
+def generate_backend_sheet(data_files, existing_data=None, is_incremental=False):
     # 使用新的健壮的处理函数
-    df = process_cumulative_files(data_files, '时间', sort_by_col='当日总盈利')
+    df = process_cumulative_files(data_files, '时间', sort_by_col='当日总盈利', existing_data=existing_data, is_incremental=is_incremental)
     if df is None or df.empty: return None
     
     df = df.sort_values(by='时间').reset_index(drop=True)
@@ -531,10 +547,367 @@ def generate_daily_channel_sheet(q_files, u_files, e_files):
             
     return final_df[output_columns]
 
+def generate_daily_summary_report(backend_files, channel_quality_files, user_quality_files, economic_files):
+    """
+    生成VNL大盘日报，包含每日详细数据和总计、日均数据
+    """
+    print("正在生成VNL大盘日报...")
+    
+    # 处理后台数据
+    backend_data = None
+    if backend_files:
+        try:
+            backend_df = process_cumulative_files(backend_files, '时间', sort_by_col='当日总盈利')
+            if backend_df is not None and not backend_df.empty:
+                backend_data = backend_df.sort_values(by='时间').reset_index(drop=True)
+                print(f"  后台数据: {len(backend_data)} 行")
+        except Exception as e:
+            print(f"  处理后台数据出错: {e}")
+    
+    # 处理渠道数据
+    channel_data = None
+    if all([channel_quality_files, user_quality_files, economic_files]):
+        try:
+            df_q = pd.read_csv(channel_quality_files[0], sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+            df_u = pd.read_csv(user_quality_files[0], sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+            df_e = pd.read_csv(economic_files[0], sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+            
+            merged = pd.merge(df_q, df_u, on='日期', how='outer', suffixes=('_q', '_u'))
+            merged = pd.merge(merged, df_e, on='日期', how='outer')
+            
+            # 清洗数据
+            merged = merged[~merged['日期'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+            merged['日期'] = pd.to_datetime(merged['日期'], errors='coerce')
+            merged.dropna(subset=['日期'], inplace=True)
+            
+            if not merged.empty:
+                channel_data = merged.sort_values(by='日期').reset_index(drop=True)
+                print(f"  渠道数据: {len(channel_data)} 行")
+        except Exception as e:
+            print(f"  处理渠道数据出错: {e}")
+    
+    # 合并数据生成大盘日报
+    if backend_data is None and channel_data is None:
+        print("  警告：没有可用的数据生成大盘日报")
+        return None
+    
+    # 创建大盘日报数据结构
+    daily_report_data = []
+    
+    # 获取日期范围
+    all_dates = set()
+    if backend_data is not None:
+        all_dates.update(backend_data['时间'].dt.date)
+    if channel_data is not None:
+        all_dates.update(channel_data['日期'].dt.date)
+    
+    if not all_dates:
+        print("  警告：没有找到有效日期")
+        return None
+    
+    # 按日期排序
+    sorted_dates = sorted(all_dates)
+    
+    for date in sorted_dates:
+        # 查找对应日期的数据
+        backend_row = None
+        channel_row = None
+        
+        if backend_data is not None:
+            backend_match = backend_data[backend_data['时间'].dt.date == date]
+            if not backend_match.empty:
+                backend_row = backend_match.iloc[0]
+        
+        if channel_data is not None:
+            channel_match = channel_data[channel_data['日期'].dt.date == date]
+            if not channel_match.empty:
+                channel_row = channel_match.iloc[0]
+        
+        # 构建日报行数据
+        row_data = {
+            '日期': date.strftime('%#d/%#m/%Y'),
+            '总消耗(U)': backend_row.get('当日总流水', 0) if backend_row is not None else 0,
+            '首充成本(U)': 0,  # 需要计算
+            '一级首充成本(U)': 0,  # 需要计算
+            '充提差比': 0,  # 需要计算
+            '总充提差(U)': backend_row.get('充提差', 0) if backend_row is not None else 0,
+            '充值金额(U)': backend_row.get('商城充值金额', 0) if backend_row is not None else 0,
+            '首充充值金额(U)': 0,  # 需要计算
+            '老用户充值金额(U)': 0,  # 需要计算
+            '人均充值金额(U)': backend_row.get('人均充值', 0) if backend_row is not None else 0,
+            '人均充值笔数': 0,  # 需要计算
+            '首充人均充值金额(U)': 0,  # 需要计算
+            '老用户人均充值金额U': 0,  # 需要计算
+            '老用户付费率': 0,  # 需要计算
+            '14日LTV': 0,  # 需要从LTV数据获取
+            '30日LTV': 0,  # 需要从LTV数据获取
+            '首充次日复充率': 0,  # 需要计算
+            '首充3日复充率': 0,  # 需要计算
+            '首充7日复充率': 0,  # 需要计算
+            '首充30日复充率': 0,  # 需要计算
+            '非一级首充人数/首充人数': 0,  # 需要计算
+            '非一级首充人数/充值人数': 0,  # 需要计算
+            '首充数转化率': 0,  # 需要计算
+            '新增注册人数': backend_row.get('新增人员', 0) if backend_row is not None else 0,
+            '首充人数': backend_row.get('新增充值人数', 0) if backend_row is not None else 0,
+            '一级首充人数': backend_row.get('一级新充人数', 0) if backend_row is not None else 0,
+            '充值人数': backend_row.get('充值人数', 0) if backend_row is not None else 0,
+            '投注用户数': backend_row.get('投注人数', 0) if backend_row is not None else 0,
+            '充投用户数': backend_row.get('充值投注人数', 0) if backend_row is not None else 0,
+            '首充次日复登率': 0,  # 需要计算
+            '首充3日复登率': 0,  # 需要计算
+            '首充7日复登率': 0,  # 需要计算
+            '首充次日复投率': 0,  # 需要计算
+            '首充3日复投率': 0,  # 需要计算
+            '首充7日复投率': 0,  # 需要计算
+            '投注金额(U)': 0,  # 需要计算
+            '出入人数比': 0,  # 需要计算
+            '游戏盈亏投注比': 0,  # 需要计算
+            '投充比': backend_row.get('今日投充比', 0) if backend_row is not None else 0,
+            '佣金金额(U)': 0,  # 需要计算
+            '彩金赠送充值比': 0,  # 需要计算
+            '历史营收(历史充提差-历史消耗)': 0,  # 需要计算
+            '历史充提差': 0,  # 需要计算
+            '历史消耗': 0,  # 需要计算
+        }
+        
+        daily_report_data.append(row_data)
+    
+    # 创建DataFrame
+    daily_df = pd.DataFrame(daily_report_data)
+    
+    # 计算总计和日均
+    total_row = {
+        '日期': '总计',
+        '总消耗(U)': daily_df['总消耗(U)'].sum(),
+        '首充成本(U)': 0,  # 需要计算
+        '一级首充成本(U)': 0,  # 需要计算
+        '充提差比': 0,  # 需要计算
+        '总充提差(U)': daily_df['总充提差(U)'].sum(),
+        '充值金额(U)': daily_df['充值金额(U)'].sum(),
+        '首充充值金额(U)': 0,  # 需要计算
+        '老用户充值金额(U)': 0,  # 需要计算
+        '人均充值金额(U)': 0,  # 需要计算
+        '人均充值笔数': 0,  # 需要计算
+        '首充人均充值金额(U)': 0,  # 需要计算
+        '老用户人均充值金额U': 0,  # 需要计算
+        '老用户付费率': 0,  # 需要计算
+        '14日LTV': 0,  # 需要计算
+        '30日LTV': 0,  # 需要计算
+        '首充次日复充率': 0,  # 需要计算
+        '首充3日复充率': 0,  # 需要计算
+        '首充7日复充率': 0,  # 需要计算
+        '首充30日复充率': 0,  # 需要计算
+        '非一级首充人数/首充人数': 0,  # 需要计算
+        '非一级首充人数/充值人数': 0,  # 需要计算
+        '首充数转化率': 0,  # 需要计算
+        '新增注册人数': daily_df['新增注册人数'].sum(),
+        '首充人数': daily_df['首充人数'].sum(),
+        '一级首充人数': daily_df['一级首充人数'].sum(),
+        '充值人数': daily_df['充值人数'].sum(),
+        '投注用户数': daily_df['投注用户数'].sum(),
+        '充投用户数': daily_df['充投用户数'].sum(),
+        '首充次日复登率': 0,  # 需要计算
+        '首充3日复登率': 0,  # 需要计算
+        '首充7日复登率': 0,  # 需要计算
+        '首充次日复投率': 0,  # 需要计算
+        '首充3日复投率': 0,  # 需要计算
+        '首充7日复投率': 0,  # 需要计算
+        '投注金额(U)': 0,  # 需要计算
+        '出入人数比': 0,  # 需要计算
+        '游戏盈亏投注比': 0,  # 需要计算
+        '投充比': 0,  # 需要计算
+        '佣金金额(U)': 0,  # 需要计算
+        '彩金赠送充值比': 0,  # 需要计算
+        '历史营收(历史充提差-历史消耗)': 0,  # 需要计算
+        '历史充提差': 0,  # 需要计算
+        '历史消耗': 0,  # 需要计算
+    }
+    
+    # 计算日均
+    days_count = len(daily_df)
+    avg_row = {
+        '日期': '日均',
+        '总消耗(U)': daily_df['总消耗(U)'].mean(),
+        '首充成本(U)': 0,  # 需要计算
+        '一级首充成本(U)': 0,  # 需要计算
+        '充提差比': 0,  # 需要计算
+        '总充提差(U)': daily_df['总充提差(U)'].mean(),
+        '充值金额(U)': daily_df['充值金额(U)'].mean(),
+        '首充充值金额(U)': 0,  # 需要计算
+        '老用户充值金额(U)': 0,  # 需要计算
+        '人均充值金额(U)': 0,  # 需要计算
+        '人均充值笔数': 0,  # 需要计算
+        '首充人均充值金额(U)': 0,  # 需要计算
+        '老用户人均充值金额U': 0,  # 需要计算
+        '老用户付费率': 0,  # 需要计算
+        '14日LTV': 0,  # 需要计算
+        '30日LTV': 0,  # 需要计算
+        '首充次日复充率': 0,  # 需要计算
+        '首充3日复充率': 0,  # 需要计算
+        '首充7日复充率': 0,  # 需要计算
+        '首充30日复充率': 0,  # 需要计算
+        '非一级首充人数/首充人数': 0,  # 需要计算
+        '非一级首充人数/充值人数': 0,  # 需要计算
+        '首充数转化率': 0,  # 需要计算
+        '新增注册人数': daily_df['新增注册人数'].mean(),
+        '首充人数': daily_df['首充人数'].mean(),
+        '一级首充人数': daily_df['一级首充人数'].mean(),
+        '充值人数': daily_df['充值人数'].mean(),
+        '投注用户数': daily_df['投注用户数'].mean(),
+        '充投用户数': daily_df['充投用户数'].mean(),
+        '首充次日复登率': 0,  # 需要计算
+        '首充3日复登率': 0,  # 需要计算
+        '首充7日复登率': 0,  # 需要计算
+        '首充次日复投率': 0,  # 需要计算
+        '首充3日复投率': 0,  # 需要计算
+        '首充7日复投率': 0,  # 需要计算
+        '投注金额(U)': 0,  # 需要计算
+        '出入人数比': 0,  # 需要计算
+        '游戏盈亏投注比': 0,  # 需要计算
+        '投充比': 0,  # 需要计算
+        '佣金金额(U)': 0,  # 需要计算
+        '彩金赠送充值比': 0,  # 需要计算
+        '历史营收(历史充提差-历史消耗)': 0,  # 需要计算
+        '历史充提差': 0,  # 需要计算
+        '历史消耗': 0,  # 需要计算
+    }
+    
+    # 合并所有数据
+    final_df = pd.concat([daily_df, pd.DataFrame([total_row]), pd.DataFrame([avg_row])], ignore_index=True)
+    
+    print(f"  大盘日报数据: {len(final_df)} 行（包含总计和日均）")
+    return final_df
+
+def format_daily_summary_sheet(writer, df, sheet_name='VNL大盘日报'):
+    """
+    格式化VNL大盘日报sheet，包含单元格内柱状图等可视化元素
+    """
+    workbook = writer.book
+    worksheet = workbook.create_sheet(title=sheet_name)
+    
+    # 设置表头
+    headers = [
+        '日期', '总消耗(U)', '首充成本(U)', '一级首充成本(U)', '充提差比', '总充提差(U)', 
+        '充值金额(U)', '首充充值金额(U)', '老用户充值金额(U)', '人均充值金额(U)', 
+        '人均充值笔数', '首充人均充值金额(U)', '老用户人均充值金额U', '老用户付费率', 
+        '14日LTV', '30日LTV', '首充次日复充率', '首充3日复充率', '首充7日复充率', 
+        '首充30日复充率', '非一级首充人数/首充人数', '非一级首充人数/充值人数', 
+        '首充数转化率', '新增注册人数', '首充人数', '一级首充人数', '充值人数',
+        '投注用户数', '充投用户数', '首充次日复登率', '首充3日复登率', '首充7日复登率',
+        '首充次日复投率', '首充3日复投率', '首充7日复投率', '投注金额(U)', 
+        '出入人数比', '游戏盈亏投注比', '投充比', '佣金金额(U)', '彩金赠送充值比',
+        '历史营收(历史充提差-历史消耗)', '历史充提差', '历史消耗'
+    ]
+    
+    # 写入表头
+    for col_idx, header in enumerate(headers, 1):
+        worksheet.cell(row=1, column=col_idx).value = header
+    
+    # 写入数据
+    for row_idx, (_, row) in enumerate(df.iterrows(), 2):
+        for col_idx, header in enumerate(headers, 1):
+            value = row.get(header, '')
+            if isinstance(value, (int, float)) and value != 0:
+                worksheet.cell(row=row_idx, column=col_idx).value = value
+            else:
+                worksheet.cell(row=row_idx, column=col_idx).value = value
+    
+    # 添加单元格内柱状图效果（条件格式）
+    try:
+        # 获取数据行数（排除总计和日均行）
+        data_rows = len(df) - 2
+        if data_rows > 0:
+            # 为复充率列添加数据条效果
+            retention_columns = [
+                ('首充次日复充率', 17),  # Q列
+                ('首充3日复充率', 18),   # R列
+                ('首充7日复充率', 19),   # S列
+                ('首充30日复充率', 20),  # T列
+            ]
+            
+            for col_name, col_idx in retention_columns:
+                # 创建数据条规则
+                data_bar_rule = DataBarRule(
+                    start_type='min',
+                    start_value=0,
+                    end_type='max',
+                    end_value=100,
+                    color='4F81BD',  # 蓝色
+                    showValue=True,
+                    minLength=None,
+                    maxLength=None
+                )
+                
+                # 应用数据条规则到数据区域（排除总计和日均行）
+                data_range = f"{get_column_letter(col_idx)}2:{get_column_letter(col_idx)}{data_rows + 1}"
+                worksheet.conditional_formatting.add(data_range, data_bar_rule)
+            
+            # 为其他数值列添加数据条效果
+            numeric_columns = [
+                ('总消耗(U)', 2),      # B列
+                ('充值金额(U)', 7),     # G列
+                ('新增注册人数', 24),   # X列
+                ('首充人数', 25),       # Y列
+                ('充值人数', 28),       # AB列
+            ]
+            
+            for col_name, col_idx in numeric_columns:
+                # 创建数据条规则
+                data_bar_rule = DataBarRule(
+                    start_type='min',
+                    start_value=0,
+                    end_type='max',
+                    end_value=None,
+                    color='70AD47',  # 绿色
+                    showValue=True,
+                    minLength=None,
+                    maxLength=None
+                )
+                
+                # 应用数据条规则到数据区域
+                data_range = f"{get_column_letter(col_idx)}2:{get_column_letter(col_idx)}{data_rows + 1}"
+                worksheet.conditional_formatting.add(data_range, data_bar_rule)
+            
+            print(f"  已添加单元格内柱状图效果到 {sheet_name}")
+    except Exception as e:
+        print(f"  添加条件格式时出错: {e}")
+    
+    # 设置列宽
+    for col_idx in range(1, len(headers) + 1):
+        column_letter = get_column_letter(col_idx)
+        worksheet.column_dimensions[column_letter].width = 15
+    
+    print(f"  {sheet_name} sheet 已格式化完成")
+
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     output_excel_filename = os.path.join(script_dir, CONFIG["OUTPUT_FILENAME"])
+    
+    # 检查是否存在现有的Excel文件
+    existing_data = {}
+    is_incremental = False
+    
+    if os.path.exists(output_excel_filename):
+        print(f"发现现有Excel文件: {os.path.basename(output_excel_filename)}")
+        print("将进行增量更新模式（保留历史数据，更新/新增新数据）...")
+        is_incremental = True
+        
+        # 读取现有数据，用于智能更新
+        try:
+            existing_df = pd.read_excel(output_excel_filename, sheet_name=None)
+            for sheet_name, df in existing_df.items():
+                if '时间' in df.columns:
+                    # 将时间转换为字符串用于比较
+                    existing_data[sheet_name] = set(df['时间'].astype(str).tolist())
+            print(f"现有数据包含 {len(existing_data)} 个sheet的数据")
+        except Exception as e:
+            print(f"读取现有文件出错: {e}")
+            print("将使用完全重写模式...")
+            is_incremental = False
+    else:
+        print("未发现现有Excel文件，将创建新文件...")
     
     def find_files(pattern):
         files = glob.glob(os.path.join(script_dir, pattern))
@@ -598,22 +971,39 @@ def main():
 
     print("\n--- 开始写入Excel文件 ---")
     
-    if os.path.exists(output_excel_filename):
-        try:
-            os.remove(output_excel_filename)
-        except PermissionError:
-            print(f"\n错误：无法删除旧的报表文件 '{output_excel_filename}'。")
-            print("请先手动关闭这个Excel文件，然后重新运行脚本。")
-            return
-            
-    pd.DataFrame().to_excel(output_excel_filename)
+    # 根据是否为增量模式决定是否删除现有文件
+    if not is_incremental:
+        if os.path.exists(output_excel_filename):
+            try:
+                os.remove(output_excel_filename)
+            except PermissionError:
+                print(f"\n错误：无法删除旧的报表文件 '{output_excel_filename}'。")
+                print("请先手动关闭这个Excel文件，然后重新运行脚本。")
+                return
+        pd.DataFrame().to_excel(output_excel_filename)
+    else:
+        # 增量模式：保留现有文件，只更新数据
+        print("增量更新模式：将保留现有数据并添加新数据")
 
     with pd.ExcelWriter(output_excel_filename, engine='openpyxl') as writer:
         
         print("\n正在处理 '后台' sheet...")
-        if (backend_data := generate_backend_sheet(backend_files)) is not None and not backend_data.empty:
-            backend_data.to_excel(writer, sheet_name='后台', index=False)
-            print("- '后台' sheet 已写入。")
+        if (backend_data := generate_backend_sheet(backend_files, existing_data.get('后台', None), is_incremental)) is not None and not backend_data.empty:
+            if is_incremental and '后台' in existing_data:
+                # 增量模式：合并新旧数据
+                try:
+                    existing_backend = pd.read_excel(output_excel_filename, sheet_name='后台')
+                    combined_data = pd.concat([existing_backend, backend_data], ignore_index=True)
+                    combined_data = combined_data.drop_duplicates(subset=['时间'], keep='last').sort_values('时间')
+                    combined_data.to_excel(writer, sheet_name='后台', index=False)
+                    print("- '后台' sheet 已增量更新。")
+                except Exception as e:
+                    print(f"增量更新失败，使用新数据: {e}")
+                    backend_data.to_excel(writer, sheet_name='后台', index=False)
+                    print("- '后台' sheet 已写入。")
+            else:
+                backend_data.to_excel(writer, sheet_name='后台', index=False)
+                print("- '后台' sheet 已写入。")
 
         print("\n正在处理 '推广渠道统计' sheet...")
         if (channel_data := generate_channel_sheet(channel_quality_files, user_quality_files, economic_files)) is not None and not channel_data.empty:
@@ -965,13 +1355,19 @@ def main():
                 
                 # 只对LTV相关的数值列进行汇总，保留其他字段
                 ltv_numeric_cols = ['金额', '付费用户数', '金额.1', '付费用户数.1', 
-                                   '金额.2', '付费用户数.2', '金额.3', '金额.4', '付费用户数.3', 
+                                   '金额.2', '付费用户数.2', '金额.3', 'Unnamed: 18', '金额.4', '付费用户数.3', 
                                    '金额.5', '付费用户数.4', '金额.6', '付费用户数.5']
                 
-                # 确保LTV数值列是数值类型
+                # 确保LTV数值列是数值类型，处理$符号
                 for col in ltv_numeric_cols:
                     if col in merged.columns:
-                        merged[col] = pd.to_numeric(merged[col], errors='coerce').fillna(0)
+                        # 处理金额列中的$符号
+                        if '金额' in col:
+                            merged[col] = pd.to_numeric(merged[col].astype(str).str.replace('$', ''), errors='coerce').fillna(0)
+                            # 四舍五入到2位小数，避免浮点数精度问题
+                            merged[col] = merged[col].round(2)
+                        else:
+                            merged[col] = pd.to_numeric(merged[col], errors='coerce').fillna(0)
                 
                 # 先处理消耗列，去除$符号并转换为数值
                 if '消耗' in merged.columns:
@@ -998,6 +1394,11 @@ def main():
                 
                 merged = merged.groupby('时间').agg(agg_dict).reset_index()
                 merged = merged.sort_values('时间')
+                
+                # 对金额列再次进行四舍五入，确保没有浮点数精度问题
+                for col in ltv_numeric_cols:
+                    if col in merged.columns and '金额' in col:
+                        merged[col] = merged[col].round(2)
                 
                 # print(f"    汇总后数据行数: {len(merged)}")
                 # print(f"    汇总后消耗列示例: {merged['消耗'].head(3).tolist()}")
@@ -1028,7 +1429,7 @@ def main():
                 
                 # LTV数据提取
                 def extract_ltv_data(col_name, amount_col, user_col):
-                    # 根据实际的CSV列名映射（从终端输出看到的真实列名）
+                    # 根据实际的CSV列名映射（pandas会自动重命名重复列名）
                     col_mapping = {
                         '首日': ('金额', '付费用户数'),           # 第11,12列
                         '2日': ('金额.1', '付费用户数.1'),        # 第13,14列  
@@ -1108,6 +1509,13 @@ def main():
             print("\n正在处理 '投放LTV' sheet...")
             format_ltv_sheet(writer, ad_ltv_files, '投放LTV', is_platform=False)
             print("- '投放LTV' sheet 已写入并格式化。")
+        
+        # 生成VNL大盘日报
+        print("\n正在处理 'VNL大盘日报' sheet...")
+        daily_summary_data = generate_daily_summary_report(backend_files, channel_quality_files, user_quality_files, economic_files)
+        if daily_summary_data is not None and not daily_summary_data.empty:
+            format_daily_summary_sheet(writer, daily_summary_data, 'VNL大盘日报')
+            print("- 'VNL大盘日报' sheet 已写入并格式化。")
         
         if 'Sheet1' in writer.book.sheetnames:
             writer.book.remove(writer.book['Sheet1'])
