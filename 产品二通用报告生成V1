@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 # --- 1. 配置区 ---
 CONFIG = {
     "PLATFORM_NAME": "vnl平台",
-    "OUTPUT_FILENAME": "最终生成的报表.xlsx"
+    "OUTPUT_FILENAME": "final_report_v5.xlsx"
 }
 
 # --- 2. 各Sheet的最终列名定义 ---
@@ -25,15 +25,119 @@ CHANNEL_TARGET_COLUMNS = [
 ]
 RETENTION_COLUMNS = ['时间', '首充人数', '次日', '3日', '4日', '5日', '6日', '7日', '8日', '9日', '10日', '11日', '12日', '13日', '14日', '15日', '16日', '17日', '18日', '19日', '20日', '21日', '22日', '23日', '24日', '25日', '26日', '27日', '28日', '29日', '30日']
 
+def format_channel_retention_sheet(writer, files, sheet_name, summary_days, first_pay_mapping=None):
+    """格式化渠道留存sheet"""
+    workbook = writer.book
+    ws = workbook.create_sheet(title=sheet_name)
+    
+    # 按截图格式设置表头
+    # 第一行：时间、首充人数、留存率（合并到7日）、方式、总代号、时间、首充人数、留存率（合并到30日）
+    ws.cell(row=1, column=1).value = '时间'
+    ws.cell(row=1, column=2).value = '首充人数'
+    ws.merge_cells(start_row=1, start_column=3, end_row=1, end_column=6)  # 留存率合并到7日
+    ws.cell(row=1, column=3).value = '留存率'
+    ws.cell(row=1, column=7).value = '方式'
+    ws.cell(row=1, column=8).value = '总代号'
+    ws.cell(row=1, column=9).value = '时间'
+    ws.cell(row=1, column=10).value = '首充人数'
+    ws.merge_cells(start_row=1, start_column=11, end_row=1, end_column=17)  # 留存率合并到30日
+    ws.cell(row=1, column=11).value = '留存率'
+    
+    # 第二行：具体列名
+    # 左侧：时间、首充人数、次日、3日、7日、30日、方式、总代号
+    # 右侧：时间、首充人数、次日、3日、4日、5日、6日、7日、30日
+    left_headers = ['时间', '首充人数', '次日', '3日', '7日', '30日', '方式', '总代号']
+    right_headers = ['时间', '首充人数', '次日', '3日', '4日', '5日', '6日', '7日', '30日']
+    
+    for i, h in enumerate(left_headers, 1):
+        ws.cell(row=2, column=i).value = h
+    for i, h in enumerate(right_headers, 9):
+        ws.cell(row=2, column=i).value = h
+
+    # 按总代号分组处理文件
+    agent_groups = {}
+    for fp in files:
+        try:
+            basename = os.path.basename(fp)
+            print(f"  Processing file: {basename}")
+            # 提取总代号：download_first_login_return_1102 _ TL_333_XXX_AAA_DP_本月_2025-10-16
+            # 或者：用户留存率_首充复登_1102 _ TL_333_XXX_AAA_DP_本月_2025-10-21
+            # 或者：用户留存率_首充复充_1102 _ TL_333_XXX_AAA_DP_本月_2025-10-21
+            m = re.search(r'(?:download_first_(?:login|recharge)_return_|用户留存率_首充(?:复登|复充)_)(\d+)\s*_', basename)
+            if m:
+                agent_code = m.group(1)
+                if agent_code not in agent_groups:
+                    agent_groups[agent_code] = []
+                agent_groups[agent_code].append(fp)
+        except Exception as e:
+            print(f"    Error processing {basename}: {e}")
+    
+    # 处理每个总代号的数据
+    row = 3
+    for agent_code, agent_files in agent_groups.items():
+        print(f"  Processing agent {agent_code} with {len(agent_files)} files")
+        
+        # 获取总代号对应的渠道信息
+        channel_info = None
+        for rule in CHANNEL_RULES:
+            if rule['代码'] == agent_code:
+                channel_info = rule
+                break
+        
+        if not channel_info:
+            print(f"    Warning: No channel info found for agent {agent_code}")
+            continue
+            
+        # 处理每个文件的数据
+        for file_path in agent_files:
+            try:
+                df = pd.read_csv(file_path, encoding='utf-8')
+                
+                # 过滤掉数据汇总行
+                if '时间' in df.columns:
+                    df = df[~df['时间'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+                
+                print(f"    Processing file: {os.path.basename(file_path)}")
+                print(f"    Data shape after filtering: {df.shape}")
+                
+                # 处理每一行数据
+                for _, data_row in df.iterrows():
+                    # 左侧数据：时间、首充人数、次日、3日、7日、30日、方式、总代号
+                    ws.cell(row=row, column=1).value = data_row['时间']
+                    ws.cell(row=row, column=2).value = data_row['首充人数']
+                    ws.cell(row=row, column=3).value = data_row['次日']
+                    ws.cell(row=row, column=4).value = data_row['3日']
+                    ws.cell(row=row, column=5).value = data_row['7日']
+                    ws.cell(row=row, column=6).value = data_row['30日']
+                    ws.cell(row=row, column=7).value = channel_info['分类']
+                    ws.cell(row=row, column=8).value = agent_code  # 显示总代号（数字），如1102, 1103
+                    
+                    # 右侧数据：时间、首充人数、次日、3日、4日、5日、6日、7日、30日
+                    ws.cell(row=row, column=9).value = data_row['时间']
+                    ws.cell(row=row, column=10).value = data_row['首充人数']
+                    ws.cell(row=row, column=11).value = data_row['次日']
+                    ws.cell(row=row, column=12).value = data_row['3日']
+                    ws.cell(row=row, column=13).value = data_row.get('4日', '')
+                    ws.cell(row=row, column=14).value = data_row.get('5日', '')
+                    ws.cell(row=row, column=15).value = data_row.get('6日', '')
+                    ws.cell(row=row, column=16).value = data_row['7日']
+                    ws.cell(row=row, column=17).value = data_row['30日']
+                    
+                    row += 1
+                    
+            except Exception as e:
+                print(f"    Error processing file {file_path}: {e}")
+                continue
+
 CHANNEL_RULES = [
-    {'代码': '1102', '名称': 'TL_333_XXX_AAA_DP', '分类': '投放'},
-    {'代码': '1103', '名称': 'TL_333_XXX_AAA_JG', '分类': '投放'},
+    {'代码': '1102', '名称': 'TL_333_XXX_AAA_DP', '分类': '短信'},
+    {'代码': '1103', '名称': 'TL_333_XXX_AAA_JG', '分类': '短信'},
     {'代码': '1104', '名称': 'TL_111_KKK_BBB_A8', '分类': '投放'},
     {'代码': '1105', '名称': 'TL_111_KKK_BBB_TF', '分类': '投放'},
     {'代码': '1106', '名称': 'TL_111_KKK_BBB_XN', '分类': '投放'},
-    {'代码': '1107', '名称': 'TL_333_XXX_AAA_A81', '分类': '网红'},
+    {'代码': '1107', '名称': 'TL_333_XXX_AAA_A81', '分类': '短信'},
     {'代码': '1108', '名称': 'TL_111_KKK_BBB_A82', '分类': '投放'},
-    {'代码': '1109', '名称': 'TL_222_III_AAA_HZ', '分类': '投放'},
+    {'代码': '1109', '名称': 'TL_222_III_AAA_HZ', '分类': '网红'},
     {'代码': '1110', '名称': 'TL_111_GGG_AAA_A8', '分类': '投放'},
     {'代码': '1111', '名称': 'TL_111_KKK_BBB_OK', '分类': '投放'},
     {'代码': '1112', '名称': 'TL_111_QQQ_AAA_A8SEO', '分类': '投放'},
@@ -49,18 +153,18 @@ def process_cumulative_files(files, date_col_name, sort_by_col=None, existing_da
     支持增量更新模式：保留历史数据，只处理新数据。
     """
     if not files: 
-        print(f"  警告：没有找到文件")
+        print(f"  Warning: No files found")
         return None
     
     try:
-        print(f"  正在处理 {len(files)} 个文件...")
+        print(f"  Processing {len(files)} files...")
         df = pd.concat([pd.read_csv(f, sep=',', engine='python', on_bad_lines='skip', encoding='utf-8') for f in files], ignore_index=True)
         
         df.columns = df.columns.str.strip()
-        print(f"  文件列名: {list(df.columns)}")
+        print(f"  File columns: {len(df.columns)} columns")
         
         if date_col_name not in df.columns: 
-            print(f"  错误：找不到日期列 '{date_col_name}'")
+            print(f"  Error: Cannot find date column '{date_col_name}'")
             return None
         
         df = df[~df[date_col_name].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
@@ -68,7 +172,7 @@ def process_cumulative_files(files, date_col_name, sort_by_col=None, existing_da
         df.dropna(subset=[date_col_name], inplace=True)
 
         if df.empty:
-            print(f"  警告：过滤后数据为空")
+            print(f"  Warning: Data is empty after filtering")
             return None
         
         # 增量更新逻辑：如果是增量模式且有现有数据，只保留新数据
@@ -77,10 +181,10 @@ def process_cumulative_files(files, date_col_name, sort_by_col=None, existing_da
             # 只保留不在现有数据中的新日期
             new_data = df[~df['时间_str'].isin(existing_data)]
             if len(new_data) > 0:
-                print(f"  发现 {len(new_data)} 行新数据（增量更新）")
+                print(f"  Found {len(new_data)} new data rows (incremental update)")
                 df = new_data.drop('时间_str', axis=1)
             else:
-                print(f"  无新数据，跳过此文件组")
+                print(f"  No new data, skipping this file group")
                 return None
 
         # 核心逻辑：在去重前，先按日期和数据完整性排序
@@ -88,7 +192,7 @@ def process_cumulative_files(files, date_col_name, sort_by_col=None, existing_da
         sort_columns = [date_col_name]
         if sort_by_col and sort_by_col in df.columns:
             sort_columns.append(sort_by_col)
-            print(f"  使用列 '{sort_by_col}' 进行数据完整性排序")
+            print(f"  Using column '{sort_by_col}' for data integrity sorting")
             df.sort_values(by=sort_columns, ascending=True, na_position='first', inplace=True)
         else:
             # 自动识别留存相关列（包含“日”且不是日期列）
@@ -96,11 +200,11 @@ def process_cumulative_files(files, date_col_name, sort_by_col=None, existing_da
             if retention_like_cols:
                 completeness_col = '__completeness__'
                 df[completeness_col] = df[retention_like_cols].notna().sum(axis=1)
-                print(f"  按留存列完整度排序，涉及列数: {len(retention_like_cols)}")
+                print(f"  Sorting by retention column completeness, columns: {len(retention_like_cols)}")
                 # 低完整度在前，高完整度在后；去重时保留最后一条（最完整）
                 df.sort_values(by=[date_col_name, completeness_col], ascending=[True, True], na_position='first', inplace=True)
             else:
-                print(f"  未找到排序列 '{sort_by_col}'，仅按日期排序")
+                print(f"  Sort column '{sort_by_col}' not found, sorting by date only")
         df.sort_values(by=sort_columns, ascending=True, na_position='first', inplace=True)
 
         # 现在去重，可以安全地保留最后一条（即最完整）的记录
@@ -108,11 +212,11 @@ def process_cumulative_files(files, date_col_name, sort_by_col=None, existing_da
         df.drop_duplicates(subset=[date_col_name], keep='last', inplace=True)
         if '__completeness__' in df.columns:
             df.drop(columns='__completeness__', inplace=True)
-        print(f"  去重前: {original_count} 行，去重后: {len(df)} 行")
+        print(f"  Before deduplication: {original_count} rows, after: {len(df)} rows")
         
         return df
     except Exception as e:
-        print(f"  处理文件 {files} 时出错: {e}")
+        print(f"  Error processing files {files}: {e}")
         import traceback
         traceback.print_exc()
         return None
@@ -120,7 +224,7 @@ def process_cumulative_files(files, date_col_name, sort_by_col=None, existing_da
 
 def generate_backend_sheet(data_files, existing_data=None, is_incremental=False):
     # 使用新的健壮的处理函数
-    df = process_cumulative_files(data_files, '时间', sort_by_col='当日总盈利', existing_data=existing_data, is_incremental=is_incremental)
+    df = process_cumulative_files(data_files, '时间', sort_by_col=None, existing_data=existing_data, is_incremental=is_incremental)
     if df is None or df.empty: return None
     
     df = df.sort_values(by='时间').reset_index(drop=True)
@@ -133,35 +237,97 @@ def generate_backend_sheet(data_files, existing_data=None, is_incremental=False)
 
 
 def generate_channel_sheet(quality_files, user_files, economic_files):
-    # 对于渠道统计，它只有一个文件，可以直接合并
-    if not all([quality_files, user_files, economic_files]): return None
+    print(f"  Processing promotion channel statistics, file count: q={len(quality_files)}, u={len(user_files)}, e={len(economic_files)}")
+    
+    if not any([quality_files, user_files, economic_files]): 
+        print("  Promotion channel statistics files completely missing")
+        return None
+    
     try:
-        df_q = pd.read_csv(quality_files[0], sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
-        df_u = pd.read_csv(user_files[0], sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
-        df_e = pd.read_csv(economic_files[0], sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+        # 处理所有文件，而不是只处理第一个
+        all_data = []
         
-        merged = pd.merge(df_q, df_u, on='日期', how='outer', suffixes=('_q', '_u'))
-        merged = pd.merge(merged, df_e, on='日期', how='outer')
+        # 处理渠道质量文件
+        for file in quality_files:
+            try:
+                df = pd.read_csv(file, sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+                df['文件类型'] = '渠道质量'
+                all_data.append(df)
+                print(f"    Channel quality file: {os.path.basename(file)} - {df.shape}")
+            except Exception as e:
+                print(f"    Error processing channel quality file: {e}")
+        
+        # 处理用户质量文件
+        for file in user_files:
+            try:
+                df = pd.read_csv(file, sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+                df['文件类型'] = '用户质量'
+                all_data.append(df)
+                print(f"    User quality file: {os.path.basename(file)} - {df.shape}")
+            except Exception as e:
+                print(f"    Error processing user quality file: {e}")
+        
+        # 处理经济效益文件
+        for file in economic_files:
+            try:
+                df = pd.read_csv(file, sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
+                df['文件类型'] = '经济效益'
+                all_data.append(df)
+                print(f"    经济效益文件: {os.path.basename(file)} - {df.shape}")
+            except Exception as e:
+                print(f"    处理经济效益文件出错: {e}")
+        
+        if not all_data:
+            print("  没有成功加载任何数据")
+            return None
+        
+        # 合并所有数据
+        merged = pd.concat(all_data, ignore_index=True)
+        print(f"    合并后数据: {merged.shape}")
+        print(f"    列名: {list(merged.columns)}")
+
+        # 清理列名，去除多余的空格和特殊字符
+        merged.columns = merged.columns.str.strip()
+        # 处理可能的重复列名问题
+        merged.columns = [col.replace('  ', ' ') for col in merged.columns]
 
         # 清洗数据
-        merged = merged[~merged['日期'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
-        merged['日期'] = pd.to_datetime(merged['日期'], errors='coerce')
-        merged.dropna(subset=['日期'], inplace=True)
+        if '日期' in merged.columns:
+            merged = merged[~merged['日期'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+            merged['日期'] = pd.to_datetime(merged['日期'], errors='coerce')
+            merged.dropna(subset=['日期'], inplace=True)
         
+        # 处理特殊字段
         if '首充' in merged.columns:
             merged['首充金额'] = merged['首充'].astype(str).str.split(' | ', expand=True).get(0)
         if '新增人员_u' in merged.columns:
             merged['新增人员'] = merged['新增人员_u']
             
+        # 创建最终DataFrame
         final_df = pd.DataFrame()
         for col in CHANNEL_TARGET_COLUMNS:
-            final_df[col] = merged[col] if col in merged.columns else None
+            if col in merged.columns:
+                final_df[col] = merged[col]
+            else:
+                final_df[col] = None
+                print(f"    警告: 列 '{col}' 不存在于数据中")
+        
+        if not final_df.empty:
+            # 过滤掉空行：只保留有首充数据的行
+            final_df = final_df.dropna(subset=['首充'], how='all')
+            # 进一步过滤：确保有实际数据（不是全NaN）
+            final_df = final_df[final_df['首充'].notna()]
             
-        final_df = final_df.sort_values(by='日期').reset_index(drop=True)
-        final_df['日期'] = final_df['日期'].dt.strftime('%#d/%#m/%Y')
-        return final_df[CHANNEL_TARGET_COLUMNS]
+            final_df = final_df.sort_values(by='日期').reset_index(drop=True)
+            final_df['日期'] = final_df['日期'].dt.strftime('%#d/%#m/%Y')
+            print(f"    最终数据: {final_df.shape}")
+            return final_df[CHANNEL_TARGET_COLUMNS]
+        else:
+            print("  最终数据为空")
+            return None
+            
     except Exception as e:
-        print(f"  处理'推广渠道统计'sheet时出错: {e}")
+        print(f"  Error processing 'Promotion Channel Statistics' sheet: {e}")
         return None
 
 def format_retention_sheet(writer, df, sheet_name, summary_cols):
@@ -266,16 +432,16 @@ def generate_retention_data(data_files):
     # 改进：不使用sort_by_col，避免因列不存在导致的问题
     df = process_cumulative_files(data_files, '时间')
     if df is None or df.empty: 
-        print("  警告：留存率数据文件为空或无法读取")
+        print("  Warning: Retention rate data file is empty or cannot be read")
         return None
 
-    print(f"  找到留存率数据，共 {len(df)} 行")
-    print(f"  列名: {list(df.columns)}")
+    print(f"  Found retention rate data, {len(df)} rows")
+    print(f"  Column names: {len(df.columns)} columns")
 
     # 规范列名
     df = _normalize_retention_columns(df)
     if '时间' not in df.columns:
-        print("  错误：留存数据中缺少'时间'列")
+        print("  Error: Retention data missing '时间' column")
         return None
 
     def extract_percentage(x):
@@ -302,91 +468,269 @@ def generate_retention_data(data_files):
     df = df.sort_values(by='时间').reset_index(drop=True)
     df['时间'] = df['时间'].dt.strftime('%#d/%#m/%Y')
     
-    print(f"  处理后的留存率数据形状: {df.shape}")
+    print(f"  Processed retention rate data shape: {df.shape}")
     return df
 
-def generate_consumption_data(quality_files, rules):
-    if not quality_files: return None
+def generate_consumption_data(ltv_files, rules):
+    """从LTV文件中提取消耗数据，按映射规则分类"""
+    if not ltv_files: return None
     try:
-        name_map = {rule['代码']: rule['名称'] for rule in rules}
+        print(f"  Processing consumption data from LTV files, file count: {len(ltv_files)}")
         
         consumption_data = []
-        for file in quality_files:
-            basename = os.path.basename(file)
-            code_match = re.search(r'推广_(\d+)', basename)
-            date_match = re.search(r'(\d{4}-\d{2}-\d{2})', basename)
-            if not code_match or not date_match: continue
-            
-            channel_code = code_match.group(1).strip()
-            date_str = date_match.group(1)
-            
-            df_c = pd.read_csv(file, sep=',', engine='python', on_bad_lines='skip', encoding='utf-8')
-            df_c.columns = df_c.columns.str.strip()
-            df_c = df_c[df_c['日期'] != '数据汇总']
-            if '当日消耗' in df_c.columns and not df_c.empty:
-                consumption = pd.to_numeric(df_c['当日消耗'].iloc[0], errors='coerce')
-                consumption_data.append({
-                    "日期": pd.to_datetime(date_str),
-                    "渠道名称": name_map.get(channel_code, f"未知_{channel_code}"),
-                    "当日消耗": consumption if pd.notna(consumption) else 0
-                })
-
-        if not consumption_data: return None
         
-        final_df = pd.DataFrame(consumption_data)
-        agg_df = final_df.groupby(['日期', '渠道名称'])['当日消耗'].sum().reset_index()
-        pivoted = agg_df.pivot_table(index='日期', columns='渠道名称', values='当日消耗', aggfunc='sum').fillna(0)
-        return pivoted
+        # 按映射规则处理每个LTV文件
+        for file in ltv_files:
+            try:
+                df = pd.read_csv(file, encoding='utf-8')
+                basename = os.path.basename(file)
+                print(f"    Processing LTV file: {basename}")
+                
+                # 从文件名提取渠道代码
+                import re
+                match = re.search(r'download_ltv_(\d+)', basename)
+                if not match:
+                    print(f"      Could not extract channel code from {basename}")
+                    continue
+                    
+                channel_code = match.group(1)
+                
+                # 根据映射规则找到对应的分类
+                channel_category = None
+                for rule in rules:
+                    if rule['代码'] == channel_code:
+                        channel_category = rule['分类']
+                        break
+                
+                if not channel_category:
+                    print(f"      No mapping found for channel code {channel_code}")
+                    continue
+                
+                print(f"      Channel {channel_code} -> {channel_category}")
+                
+                # 处理该文件的所有数据行
+                for _, row in df.iterrows():
+                    if '消耗' in df.columns and '时间' in df.columns:
+                        consumption_value = pd.to_numeric(str(row['消耗']).replace('$', ''), errors='coerce')
+                        if pd.notna(consumption_value) and consumption_value > 0:
+                            consumption_data.append({
+                                "日期": row['时间'],
+                                "渠道名称": channel_category,
+                                "当日消耗": consumption_value
+                            })
+                            print(f"      {channel_category} consumption: {consumption_value} for date: {row['时间']}")
+                            
+            except Exception as e:
+                print(f"      Error processing file {basename}: {e}")
+                continue
+
+        if not consumption_data: 
+            print("  No consumption data found")
+            return None
+        
+        print(f"  Found {len(consumption_data)} consumption data entries")
+        
+        # 按日期和渠道分类汇总消耗数据
+        df = pd.DataFrame(consumption_data)
+        if not df.empty:
+            # 按日期和渠道名称分组，汇总消耗
+            grouped = df.groupby(['日期', '渠道名称'])['当日消耗'].sum().reset_index()
+            
+            # 透视表：日期为行，渠道分类为列
+            pivot_df = grouped.pivot(index='日期', columns='渠道名称', values='当日消耗').fillna(0)
+            
+            # 添加总计列
+            pivot_df['总计'] = pivot_df.sum(axis=1)
+            
+            print(f"  Consumption data grouped by category:")
+            print(f"    Categories: {list(pivot_df.columns)}")
+            print(f"    Date range: {len(pivot_df)} days")
+            
+            return pivot_df
+        
+        return None
 
     except Exception as e:
-        print(f"  处理'消耗'sheet时出错: {e}")
+        print(f"  Error processing consumption sheet: {e}")
         return None
+
+def format_platform_ltv_sheet(writer, df, sheet_name):
+    """格式化LTV(全平台) sheet，创建简化的两行表头结构"""
+    workbook = writer.book
+    worksheet = workbook.create_sheet(title=sheet_name)
+    
+    # 第一行：主要分类标题（合并单元格）
+    headers_row1 = [
+        '时间', '消耗', '新增用户', '新增用户单价', '首充人数', 
+        '14日LTV', '', '30日LTV', '', '60日LTV', ''
+    ]
+    
+    # 第二行：具体列名
+    headers_row2 = [
+        '时间', '消耗', '新增用户', '新增用户单价', '首充人数',
+        '金额', '付费用户数', '金额', '付费用户数', '金额', '付费用户数'
+    ]
+    
+    # 写入第一行标题
+    for col, header in enumerate(headers_row1, 1):
+        worksheet.cell(row=1, column=col).value = header
+    
+    # 写入第二行标题
+    for col, header in enumerate(headers_row2, 1):
+        worksheet.cell(row=2, column=col).value = header
+    
+    # 合并LTV相关的单元格（第一行）
+    # 14日LTV (列6-7)
+    worksheet.merge_cells(start_row=1, start_column=6, end_row=1, end_column=7)
+    # 30日LTV (列8-9)
+    worksheet.merge_cells(start_row=1, start_column=8, end_row=1, end_column=9)
+    # 60日LTV (列10-11)
+    worksheet.merge_cells(start_row=1, start_column=10, end_row=1, end_column=11)
+    
+    # 写入数据
+    # 全平台LTV源文件可能列名结构：
+    # 时间, 消耗, 新增用户, 新增用户单价, 首充人数, 14日LTV, 30日LTV, 60日LTV, 金额, 付费用户数, 金额.1, 付费用户数.1, 金额.2, 付费用户数.2
+    # 或者可能有其他结构，需要灵活处理
+    
+    for row_idx, (_, row_data) in enumerate(df.iterrows(), 3):
+        # 基础列
+        worksheet.cell(row=row_idx, column=1).value = row_data.get('时间', '')
+        worksheet.cell(row=row_idx, column=2).value = row_data.get('消耗', '')
+        worksheet.cell(row=row_idx, column=3).value = row_data.get('新增用户', '')
+        worksheet.cell(row=row_idx, column=4).value = row_data.get('新增用户单价', '')
+        worksheet.cell(row=row_idx, column=5).value = row_data.get('首充人数', '')
+        
+        # 尝试多种可能的列名映射
+        # 14日LTV数据 - 可能是第一对金额/付费用户数
+        worksheet.cell(row=row_idx, column=6).value = row_data.get('金额', row_data.get('14日LTV金额', ''))
+        worksheet.cell(row=row_idx, column=7).value = row_data.get('付费用户数', row_data.get('14日LTV付费用户数', ''))
+        
+        # 30日LTV数据 - 可能是第二对
+        worksheet.cell(row=row_idx, column=8).value = row_data.get('金额.1', row_data.get('30日LTV金额', ''))
+        worksheet.cell(row=row_idx, column=9).value = row_data.get('付费用户数.1', row_data.get('30日LTV付费用户数', ''))
+        
+        # 60日LTV数据 - 可能是第三对
+        worksheet.cell(row=row_idx, column=10).value = row_data.get('金额.2', row_data.get('60日LTV金额', ''))
+        worksheet.cell(row=row_idx, column=11).value = row_data.get('付费用户数.2', row_data.get('60日LTV付费用户数', ''))
+
+def format_ltv_sheet_with_headers(writer, df, sheet_name):
+    """格式化LTV sheet，创建两行表头结构，正确处理源文件的列名"""
+    workbook = writer.book
+    worksheet = workbook.create_sheet(title=sheet_name)
+    
+    # 第一行：主要分类标题（合并单元格）
+    headers_row1 = [
+        '时间', '消耗', '新增用户', '新增用户单价', '首充人数', '付费率', 
+        '注册复登', '首充复登', '3日注册复登', '3日首充复登', '首充成本',
+        '1日LTV', '', '2日LTV', '', '3日LTV', '', '7日LTV', '', 
+        '14日LTV', '', '30日LTV', '', '60日LTV', ''
+    ]
+    
+    # 第二行：具体列名
+    headers_row2 = [
+        '时间', '消耗', '新增用户', '新增用户单价', '首充人数', '付费率',
+        '注册复登', '首充复登', '3日注册复登', '3日首充复登', '首充成本',
+        '金额', '付费用户数', '金额', '付费用户数', '金额', '付费用户数', 
+        '金额', '付费用户数', '金额', '付费用户数', '金额', '付费用户数', 
+        '金额', '付费用户数'
+    ]
+    
+    # 写入第一行标题
+    for col, header in enumerate(headers_row1, 1):
+        worksheet.cell(row=1, column=col).value = header
+    
+    # 写入第二行标题
+    for col, header in enumerate(headers_row2, 1):
+        worksheet.cell(row=2, column=col).value = header
+    
+    # 合并LTV相关的单元格（第一行）
+    # 1日LTV (列12-13)
+    worksheet.merge_cells(start_row=1, start_column=12, end_row=1, end_column=13)
+    # 2日LTV (列14-15)
+    worksheet.merge_cells(start_row=1, start_column=14, end_row=1, end_column=15)
+    # 3日LTV (列16-17)
+    worksheet.merge_cells(start_row=1, start_column=16, end_row=1, end_column=17)
+    # 7日LTV (列18-19)
+    worksheet.merge_cells(start_row=1, start_column=18, end_row=1, end_column=19)
+    # 14日LTV (列20-21)
+    worksheet.merge_cells(start_row=1, start_column=20, end_row=1, end_column=21)
+    # 30日LTV (列22-23)
+    worksheet.merge_cells(start_row=1, start_column=22, end_row=1, end_column=23)
+    # 60日LTV (列24-25)
+    worksheet.merge_cells(start_row=1, start_column=24, end_row=1, end_column=25)
+    
+    # 写入数据
+    # 源文件列名说明：
+    # - 基础列：时间, 消耗, 新增用户, 新增用户单价, 首充人数, 付费率, 注册复登, 首充复登, 3日注册复登, 3日首充复登, 首充成本
+    # - LTV标签：首日LTV, 2日LTV, 3日LTV, 7日LTV, 14日LTV, 30日LTV, 60日LTV（这些只是标签，不含数据）
+    # - LTV数据：金额, 付费用户数, 金额.1, 付费用户数.1, ... (pandas会自动加后缀)
+    
+    for row_idx, (_, row_data) in enumerate(df.iterrows(), 3):
+        # 基础列（前11列）
+        worksheet.cell(row=row_idx, column=1).value = row_data.get('时间', '')
+        worksheet.cell(row=row_idx, column=2).value = row_data.get('消耗', '')
+        worksheet.cell(row=row_idx, column=3).value = row_data.get('新增用户', '')
+        worksheet.cell(row=row_idx, column=4).value = row_data.get('新增用户单价', '')
+        worksheet.cell(row=row_idx, column=5).value = row_data.get('首充人数', '')
+        worksheet.cell(row=row_idx, column=6).value = row_data.get('付费率', '')
+        worksheet.cell(row=row_idx, column=7).value = row_data.get('注册复登', '')
+        worksheet.cell(row=row_idx, column=8).value = row_data.get('首充复登', '')
+        worksheet.cell(row=row_idx, column=9).value = row_data.get('3日注册复登', '')
+        worksheet.cell(row=row_idx, column=10).value = row_data.get('3日首充复登', '')
+        worksheet.cell(row=row_idx, column=11).value = row_data.get('首充成本', '')
+        
+        # 1日LTV数据 - 金额, 付费用户数（pandas不会给第一个加后缀）
+        worksheet.cell(row=row_idx, column=12).value = row_data.get('金额', '')
+        worksheet.cell(row=row_idx, column=13).value = row_data.get('付费用户数', '')
+        
+        # 2日LTV数据 - 金额.1, 付费用户数.1
+        worksheet.cell(row=row_idx, column=14).value = row_data.get('金额.1', '')
+        worksheet.cell(row=row_idx, column=15).value = row_data.get('付费用户数.1', '')
+        
+        # 3日LTV数据 - 金额.2, 付费用户数.2
+        worksheet.cell(row=row_idx, column=16).value = row_data.get('金额.2', '')
+        worksheet.cell(row=row_idx, column=17).value = row_data.get('付费用户数.2', '')
+        
+        # 7日LTV数据 - 金额.3, 付费用户数.3（跳过空列）
+        worksheet.cell(row=row_idx, column=18).value = row_data.get('金额.3', '')
+        worksheet.cell(row=row_idx, column=19).value = row_data.get('付费用户数.3', '')
+        
+        # 14日LTV数据 - 金额.4, 付费用户数.4
+        worksheet.cell(row=row_idx, column=20).value = row_data.get('金额.4', '')
+        worksheet.cell(row=row_idx, column=21).value = row_data.get('付费用户数.4', '')
+        
+        # 30日LTV数据 - 金额.5, 付费用户数.5
+        worksheet.cell(row=row_idx, column=22).value = row_data.get('金额.5', '')
+        worksheet.cell(row=row_idx, column=23).value = row_data.get('付费用户数.5', '')
+        
+        # 60日LTV数据 - 金额.6, 付费用户数.6
+        worksheet.cell(row=row_idx, column=24).value = row_data.get('金额.6', '')
+        worksheet.cell(row=row_idx, column=25).value = row_data.get('付费用户数.6', '')
 
 def format_consumption_sheet(writer, df, rules):
     workbook = writer.book
     worksheet = workbook.create_sheet(title='消耗')
     
-    # 基于命名规则动态归类：_333_ -> 短信；_111_ -> 投放；_222_ -> 网红；其他 -> 其他
-    def _category_from_channel_name(name: str) -> str:
-        s = str(name).upper()
-        if re.search(r'(^|_)333(_|$)', s):
-            return '短信'
-        if re.search(r'(^|_)111(_|$)', s):
-            return '投放'
-        if re.search(r'(^|_)222(_|$)', s):
-            return '网红'
-        return '其他'
-
-    header_structure = { '短信': [], '投放': [], '网红': [], '其他': [] }
-    # df 的列即渠道名称
-    for channel_name in list(df.columns):
-        cat = _category_from_channel_name(channel_name)
-        header_structure[cat].append(channel_name)
-
+    # 第1行：总计行（各列的总和）
+    worksheet.cell(row=1, column=2).value = '和'
+    worksheet.cell(row=1, column=3).value = '日期'
+    worksheet.cell(row=1, column=4).value = '当日消耗($)'
+    
+    # 第2行：列标题行
     worksheet.cell(row=2, column=1).value = '总代号匹配'
     worksheet.cell(row=2, column=2).value = '平台'
-    worksheet.cell(row=3, column=3).value = '日期'
-    worksheet.cell(row=3, column=4).value = '当日消耗($)'
-    
-    current_col = 5
-    channel_cols_map = {}
-    for category in ['短信', '投放', '网红', '其他']:
-        channels = header_structure.get(category, [])
-        if not channels: continue
-        start_col = current_col
-        worksheet.cell(row=2, column=start_col).value = category
-        for channel_name in channels:
-            worksheet.cell(row=3, column=current_col).value = channel_name
-            channel_cols_map[channel_name] = current_col
-            current_col += 1
-        if len(channels) > 1:
-            worksheet.merge_cells(start_row=2, start_column=start_col, end_row=2, end_column=current_col - 1)
-
-    channel_end_col = current_col - 1
-    total_consumption_col = current_col
-    check_col = current_col + 1
-    worksheet.cell(row=3, column=total_consumption_col).value = '渠道消耗'
-    worksheet.cell(row=3, column=check_col).value = '核对'
+    worksheet.cell(row=2, column=3).value = '日期'
+    worksheet.cell(row=2, column=4).value = '当日消耗($)'
+    worksheet.cell(row=2, column=5).value = '短信'
+    worksheet.cell(row=2, column=6).value = '短信'
+    worksheet.cell(row=2, column=7).value = '投放'
+    worksheet.cell(row=2, column=8).value = '投放'
+    worksheet.cell(row=2, column=9).value = '投放'
+    worksheet.cell(row=2, column=10).value = '投放'
+    worksheet.cell(row=2, column=11).value = '网红'
+    worksheet.cell(row=2, column=12).value = '渠道消耗'
+    worksheet.cell(row=2, column=13).value = '核对'
+    worksheet.cell(row=2, column=14).value = ''  # 无标题列
 
     # 隐藏第一列（总代号匹配）
     try:
@@ -394,69 +738,147 @@ def format_consumption_sheet(writer, df, rules):
     except Exception:
         pass
 
-    start_row = 4
+    # 第3行及以下：每日数据
+    start_row = 3
     end_row = start_row + len(df) - 1
     
-    for r_idx, (date, row_data) in enumerate(df.iterrows(), start_row):
+    for r_idx, (date_index, row_data) in enumerate(df.iterrows(), start_row):
         worksheet.cell(row=r_idx, column=2).value = CONFIG["PLATFORM_NAME"]
-        worksheet.cell(row=r_idx, column=3).value = date.strftime('%#d/%#m/%Y')
-        worksheet.cell(row=r_idx, column=4).value = f"=SUM({get_column_letter(5)}{r_idx}:{get_column_letter(channel_end_col)}{r_idx})"
         
-        for channel_name, col_idx in channel_cols_map.items():
-            if channel_name in row_data:
-                worksheet.cell(row=r_idx, column=col_idx).value = row_data[channel_name]
+        # 处理日期字段（透视表的索引是日期）
+        date_val = date_index if isinstance(date_index, str) else str(date_index)
+        worksheet.cell(row=r_idx, column=3).value = date_val
         
-        # 渠道消耗 = 当日消耗（用于核对显示 TRUE/FALSE）
-        worksheet.cell(row=r_idx, column=total_consumption_col).value = f"={get_column_letter(4)}{r_idx}"
-        worksheet.cell(row=r_idx, column=check_col).value = (
-            f"=IF(ROUND({get_column_letter(total_consumption_col)}{r_idx},2)="
-            f"ROUND({get_column_letter(4)}{r_idx},2),TRUE,FALSE)"
-        )
-
-    worksheet.cell(row=1, column=2).value = '和'
+        # 处理各分类的消耗数据
+        sms_consumption = row_data.get('短信', 0) if '短信' in row_data else 0
+        ad_consumption = row_data.get('投放', 0) if '投放' in row_data else 0
+        influencer_consumption = row_data.get('网红', 0) if '网红' in row_data else 0
+        total_consumption = row_data.get('总计', 0) if '总计' in row_data else 0
+        
+        # 设置各分类的消耗数据（每类只占一列）
+        worksheet.cell(row=r_idx, column=4).value = total_consumption  # 当日消耗($)
+        worksheet.cell(row=r_idx, column=5).value = sms_consumption   # 短信（第1列）
+        worksheet.cell(row=r_idx, column=6).value = ad_consumption    # 投放（第1列）
+        worksheet.cell(row=r_idx, column=7).value = influencer_consumption  # 网红（第1列）
+        
+        # 渠道消耗 = 各渠道消耗的总和
+        channel_total = sms_consumption + ad_consumption + influencer_consumption
+        worksheet.cell(row=r_idx, column=12).value = channel_total
+        
+        # 核对 = 当日消耗($) 是否等于 渠道消耗
+        worksheet.cell(row=r_idx, column=13).value = f"=IF(ROUND(D{r_idx},2)=ROUND(L{r_idx},2),\"TRUE\",\"FALSE\")"
+        
+        # 差值列 = 当日消耗($) - 渠道消耗
+        worksheet.cell(row=r_idx, column=14).value = f"=D{r_idx}-L{r_idx}"
+    
+    # 第1行的总计公式（各列的总和）
     if start_row <= end_row:
-        # 顶部合计按列汇总（不包含布尔列“核对”）
-        for col_idx in range(4, total_consumption_col + 1):
+        for col_idx in range(4, 15):  # D列到N列
             col_letter = get_column_letter(col_idx)
             worksheet.cell(row=1, column=col_idx).value = f"=SUM({col_letter}{start_row}:{col_letter}{end_row})"
 
 def generate_daily_channel_sheet(q_files, u_files, e_files):
-    if not all([q_files, u_files, e_files]):
+    if not any([q_files, u_files, e_files]):
+        print(f"  Daily channel statistics files missing: q={len(q_files)}, u={len(u_files)}, e={len(e_files)}")
         return None
+        
+    print(f"  Processing daily channel statistics, file count: q={len(q_files)}, u={len(u_files)}, e={len(e_files)}")
         
     file_groups = {}
     all_files = q_files + u_files + e_files
+    
+    # 从文件名提取日期的函数
+    def extract_date_from_filename(filename):
+        """从文件名中提取日期，支持多种格式"""
+        import re
+        # 支持格式：-10-17, -10.17, 2025-10-17, 2025-10-18等
+        patterns = [
+            r'(\d{4})-(\d{1,2})-(\d{1,2})',  # 2025-10-17
+            r'-(\d{1,2})\.(\d{1,2})',        # -10.17 (用点号)
+            r'-(\d{1,2})-(\d{1,2})',         # -10-17 (用连字符)
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, filename)
+            if match:
+                if len(match.groups()) == 3:  # 2025-10-17格式
+                    year, month, day = match.groups()
+                    return f"{day}/{month}/{year}"
+                elif len(match.groups()) == 2:  # -10-17 或 -10.17格式
+                    month, day = match.groups()
+                    current_year = datetime.now().year
+                    return f"{day}/{month}/{current_year}"
+        return None
+    
+    # 按日期分组，而不是按文件名分组
     for f in all_files:
-        match = re.search(r'(\(\d+\))', os.path.basename(f))
-        key = match.group(1) if match else os.path.basename(f)
+        print(f"    Processing file: {os.path.basename(f).encode('ascii', 'ignore').decode('ascii')}")
+        
+        # 从文件名提取日期
+        file_date = extract_date_from_filename(f)
+        print(f"      Extracted date: {file_date}")
+        
+        # 使用日期作为key，而不是文件名
+        key = file_date if file_date else "未知日期"
         
         if key not in file_groups:
             file_groups[key] = {}
+            file_groups[key]['date'] = file_date  # 保存日期信息
             
         if '渠道质量' in f:
             file_groups[key]['quality'] = f
+            print(f"      Categorized as: Channel Quality")
         elif '用户质量' in f:
             file_groups[key]['user'] = f
+            print(f"      Categorized as: User Quality")
         elif '经济效益' in f:
             file_groups[key]['economic'] = f
+            print(f"      Categorized as: Economic Benefit")
 
     all_days_df = []
     
+    # 简化处理：直接处理所有文件，不要求三个类型都齐全
     for key in sorted(file_groups.keys()):
         group = file_groups[key]
-        if 'quality' not in group or 'user' not in group or 'economic' not in group:
+        print(f"    Processing file group: {key}")
+        print(f"      Contains files: {list(group.keys())}")
+        
+        # 只要有任何一个文件就处理
+        if not group:
             continue
 
         try:
-            df_q = pd.read_csv(group['quality'])
-            df_u = pd.read_csv(group['user'])
-            df_e = pd.read_csv(group['economic'])
+            # 处理可用的文件
+            dfs = []
+            if 'quality' in group:
+                df_q = pd.read_csv(group['quality'])
+                print(f"      Channel quality file: {df_q.shape}")
+                dfs.append(df_q)
+            if 'user' in group:
+                df_u = pd.read_csv(group['user'])
+                print(f"      User quality file: {df_u.shape}")
+                dfs.append(df_u)
+            if 'economic' in group:
+                df_e = pd.read_csv(group['economic'])
+                print(f"      Economic benefit file: {df_e.shape}")
+                dfs.append(df_e)
+            
+            if not dfs:
+                continue
+                
+            # 合并所有可用的数据
+            merged_df = dfs[0]
+            for df in dfs[1:]:
+                if '分组名称' in df.columns and '分组名称' in merged_df.columns:
+                    merged_df = pd.merge(merged_df, df, on='分组名称', how='outer')
+                else:
+                    merged_df = pd.concat([merged_df, df], ignore_index=True)
+            
             # 基础清洗：去首尾空格
-            for d in (df_q, df_u, df_e):
-                d.columns = d.columns.map(lambda x: str(x).strip())
+            merged_df.columns = merged_df.columns.map(lambda x: str(x).strip())
+            
             # 统一常见别名，避免列名差异导致缺值
-            def _normalize_cols(d: pd.DataFrame) -> pd.DataFrame:
-                rename_map = {
+            rename_map = {
                     '老用户登录': '老用户登陆',
                     '访问': '访问量',
                     '新增': '新增用户',
@@ -465,34 +887,35 @@ def generate_daily_channel_sheet(q_files, u_files, e_files):
                     '当日消耗(USD)': '当日消耗($)',
                     '当天消耗': '当日消耗($)',
                 }
-                for k, v in list(rename_map.items()):
-                    if k in d.columns and v not in d.columns:
-                        d.rename(columns={k: v}, inplace=True)
-                return d
-            df_q, df_u, df_e = _normalize_cols(df_q), _normalize_cols(df_u), _normalize_cols(df_e)
+            for k, v in list(rename_map.items()):
+                if k in merged_df.columns and v not in merged_df.columns:
+                    merged_df.rename(columns={k: v}, inplace=True)
             
-            # 从任一文件推断日期（优先 quality，其次 user，再次 economic）
-            report_date = None
-            for d in (df_q, df_u, df_e):
-                if '日期' in d.columns and not d['日期'].dropna().empty:
-                    first_valid_date = d['日期'].dropna().iloc[0]
+            # 使用从文件名提取的日期
+            report_date = group.get('date')
+            if not report_date:
+                # 如果文件名中没有日期，尝试从数据中获取
+                if '日期' in merged_df.columns and not merged_df['日期'].dropna().empty:
+                    first_valid_date = merged_df['日期'].dropna().iloc[0]
                     parsed = pd.to_datetime(first_valid_date, errors='coerce')
                     if pd.notna(parsed):
                         report_date = parsed.strftime('%#d/%#m/%Y')
-                        break
+                else:
+                    # 如果都没有，使用当前日期
+                    report_date = datetime.now().strftime('%#d/%#m/%Y')
             
-            df_q = df_q[~df_q['分组名称'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
-            df_u = df_u[~df_u['分组名称'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
-            df_e = df_e[~df_e['分组名称'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
+            print(f"      Using date: {report_date}")
 
-            merged_df = pd.merge(df_q, df_u, on='分组名称', how='outer')
-            merged_df = pd.merge(merged_df, df_e, on='分组名称', how='outer')
+            # 过滤掉汇总行
+            if '分组名称' in merged_df.columns:
+                merged_df = merged_df[~merged_df['分组名称'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
             
             merged_df['日期'] = report_date if report_date else "未知日期"
             all_days_df.append(merged_df)
+            print(f"      Merged data: {merged_df.shape}")
 
         except Exception as e:
-            print(f"处理文件组 {key} 时出错: {e}")
+            print(f"Error processing file group {key}: {e}")
             continue
             
     if not all_days_df:
@@ -557,7 +980,7 @@ def generate_daily_summary_report(backend_files, channel_quality_files, user_qua
     backend_data = None
     if backend_files:
         try:
-            backend_df = process_cumulative_files(backend_files, '时间', sort_by_col='当日总盈利')
+            backend_df = process_cumulative_files(backend_files, '时间', sort_by_col=None)
             if backend_df is not None and not backend_df.empty:
                 backend_data = backend_df.sort_values(by='时间').reset_index(drop=True)
                 print(f"  后台数据: {len(backend_data)} 行")
@@ -890,8 +1313,8 @@ def main():
     is_incremental = False
     
     if os.path.exists(output_excel_filename):
-        print(f"发现现有Excel文件: {os.path.basename(output_excel_filename)}")
-        print("将进行增量更新模式（保留历史数据，更新/新增新数据）...")
+        print(f"Found existing Excel file: {os.path.basename(output_excel_filename)}")
+        print("Will use incremental update mode (preserve historical data, update/add new data)...")
         is_incremental = True
         
         # 读取现有数据，用于智能更新
@@ -901,35 +1324,48 @@ def main():
                 if '时间' in df.columns:
                     # 将时间转换为字符串用于比较
                     existing_data[sheet_name] = set(df['时间'].astype(str).tolist())
-            print(f"现有数据包含 {len(existing_data)} 个sheet的数据")
+            print(f"Existing data contains {len(existing_data)} sheets")
         except Exception as e:
-            print(f"读取现有文件出错: {e}")
-            print("将使用完全重写模式...")
+            print(f"Error reading existing file: {e}")
+            print("Will use complete rewrite mode...")
             is_incremental = False
     else:
-        print("未发现现有Excel文件，将创建新文件...")
+        print("No existing Excel file found, will create new file...")
     
     def find_files(pattern):
         files = glob.glob(os.path.join(script_dir, pattern))
-        print(f"查找 '{pattern}': 找到了 {len(files)} 个文件。")
+        print(f"Found {len(files)} files for pattern.")
         return files
 
     backend_files = find_files("download_ops_*.csv")
-    channel_quality_files = find_files("推广渠道统计-渠道质量*.csv")
-    user_quality_files = find_files("推广渠道统计-用户质量*.csv")
-    economic_files = find_files("推广渠道统计-经济效益*.csv")
-    login_return_files = find_files("download_first_login_return_全平台_*.csv")
-    recharge_return_files = find_files("download_first_recharge_return_全平台_*.csv")
+    channel_quality_files = find_files("*推广渠道统计-渠道质量*.csv")
+    user_quality_files = find_files("*推广渠道统计-用户质量*.csv")
+    economic_files = find_files("*推广渠道统计-经济效益*.csv")
     
-    # 添加更多可能的文件模式
+    # 如果没找到带月份的文件，尝试查找其他格式
+    if not channel_quality_files:
+        channel_quality_files = find_files("*渠道质量*.csv")
+    if not user_quality_files:
+        user_quality_files = find_files("*用户质量*.csv")
+    if not economic_files:
+        economic_files = find_files("*经济效益*.csv")
+    
+    # 查找全平台留存文件
+    login_return_files = find_files("用户留存率_首充复登_*全平台*.csv")
     if not login_return_files:
-        login_return_files = find_files("*login_return*.csv")
-    if not recharge_return_files:
-        recharge_return_files = find_files("*recharge_return*.csv")
+        login_return_files = find_files("download_first_login_return_*全平台*.csv")
+    if not login_return_files:
+        login_return_files = find_files("*首充复登*全平台*.csv")
     
-    print(f"留存率相关文件:")
-    print(f"  - 登录留存文件: {len(login_return_files)} 个")
-    print(f"  - 充值留存文件: {len(recharge_return_files)} 个")
+    recharge_return_files = find_files("用户留存率_首充复充_*全平台*.csv")
+    if not recharge_return_files:
+        recharge_return_files = find_files("download_first_recharge_return_*全平台*.csv")
+    if not recharge_return_files:
+        recharge_return_files = find_files("*首充复充*全平台*.csv")
+    
+    print(f"Retention rate related files:")
+    print(f"  - Login retention files: {len(login_return_files)}")
+    print(f"  - Recharge retention files: {len(recharge_return_files)}")
 
     # 只保留包含留存列的文件
     def _file_has_retention_cols(fp):
@@ -951,25 +1387,38 @@ def main():
 
     login_return_files = [f for f in login_return_files if _file_has_retention_cols(f)]
     recharge_return_files = [f for f in recharge_return_files if _file_has_retention_cols(f)]
-    print(f"  - 过滤后 登录留存文件: {len(login_return_files)} 个")
-    print(f"  - 过滤后 充值留存文件: {len(recharge_return_files)} 个")
+    print(f"  - Filtered login retention files: {len(login_return_files)}")
+    print(f"  - Filtered recharge retention files: {len(recharge_return_files)}")
     
     all_promo_files = find_files("推广_*.csv")
     consumption_files = [f for f in all_promo_files if '渠道质量' in os.path.basename(f)]
-    print(f"  - 筛选后，用于'消耗'sheet的'渠道质量'文件: {len(consumption_files)} 个")
+    print(f"  - Filtered consumption files: {len(consumption_files)}")
     
-    daily_q_files = find_files("每日渠道统计-渠道质量*.csv")
-    daily_u_files = find_files("每日渠道统计-用户质量*.csv")
-    daily_e_files = find_files("每日渠道统计-经济效益*.csv")
+    daily_q_files = find_files("*每日渠道统计-渠道质量*.csv")
+    daily_u_files = find_files("*每日渠道统计-用户质量*.csv")
+    daily_e_files = find_files("*每日渠道统计-经济效益*.csv")
+    
+    # 赠送类型统计文件
+    gift_stats_files = find_files("*赠送类型统计*.csv")
 
     # 渠道留存文件（按总代号分组）
-    channel_login_files = find_files("download_first_login_return_*_*.csv")
-    channel_recharge_files = find_files("download_first_recharge_return_*_*.csv")
-    print(f"渠道留存文件:")
-    print(f"  - 渠道登录留存: {len(channel_login_files)} 个")
-    print(f"  - 渠道充值留存: {len(channel_recharge_files)} 个")
+    # 渠道首充复登使用 用户留存率_首充复登 文件
+    channel_login_files = find_files("用户留存率_首充复登_*_*.csv")
+    if not channel_login_files:
+        channel_login_files = find_files("download_first_recharge_return_*_*.csv")
+    
+    # 渠道首充复充使用 用户留存率_首充复充 文件
+    channel_recharge_files = find_files("用户留存率_首充复充_*_*.csv")
+    
+    # 合并中英文文件
+    all_channel_recharge_files = channel_recharge_files
+    
+    print(f"Channel retention files:")
+    print(f"  - Channel login retention (首充复登): {len(channel_login_files)}")
+    print(f"  - Channel recharge retention (首充复充): {len(channel_recharge_files)}")
+    print(f"  - Total channel recharge files: {len(all_channel_recharge_files)}")
 
-    print("\n--- 开始写入Excel文件 ---")
+    print("\n--- Starting to write Excel file ---")
     
     # 根据是否为增量模式决定是否删除现有文件
     if not is_incremental:
@@ -977,17 +1426,17 @@ def main():
             try:
                 os.remove(output_excel_filename)
             except PermissionError:
-                print(f"\n错误：无法删除旧的报表文件 '{output_excel_filename}'。")
-                print("请先手动关闭这个Excel文件，然后重新运行脚本。")
+                print(f"\nError: Cannot delete old report file '{output_excel_filename}'.")
+                print("Please close the Excel file manually and run the script again.")
                 return
         pd.DataFrame().to_excel(output_excel_filename)
     else:
         # 增量模式：保留现有文件，只更新数据
-        print("增量更新模式：将保留现有数据并添加新数据")
+        print("Incremental update mode: will preserve existing data and add new data")
 
     with pd.ExcelWriter(output_excel_filename, engine='openpyxl') as writer:
         
-        print("\n正在处理 '后台' sheet...")
+        print("\nProcessing 'Backend' sheet...")
         if (backend_data := generate_backend_sheet(backend_files, existing_data.get('后台', None), is_incremental)) is not None and not backend_data.empty:
             if is_incremental and '后台' in existing_data:
                 # 增量模式：合并新旧数据
@@ -996,41 +1445,222 @@ def main():
                     combined_data = pd.concat([existing_backend, backend_data], ignore_index=True)
                     combined_data = combined_data.drop_duplicates(subset=['时间'], keep='last').sort_values('时间')
                     combined_data.to_excel(writer, sheet_name='后台', index=False)
-                    print("- '后台' sheet 已增量更新。")
+                    print("- 'Backend' sheet updated incrementally.")
                 except Exception as e:
-                    print(f"增量更新失败，使用新数据: {e}")
+                    print(f"Incremental update failed, using new data: {e}")
                     backend_data.to_excel(writer, sheet_name='后台', index=False)
-                    print("- '后台' sheet 已写入。")
+                    print("- 'Backend' sheet written.")
             else:
                 backend_data.to_excel(writer, sheet_name='后台', index=False)
-                print("- '后台' sheet 已写入。")
+                print("- 'Backend' sheet written.")
 
-        print("\n正在处理 '推广渠道统计' sheet...")
+        print("\nProcessing 'Promotion Channel Statistics' sheet...")
         if (channel_data := generate_channel_sheet(channel_quality_files, user_quality_files, economic_files)) is not None and not channel_data.empty:
             channel_data.to_excel(writer, sheet_name='推广渠道统计', index=False)
-            print("- '推广渠道统计' sheet 已写入。")
+            print("- 'Promotion Channel Statistics' sheet written.")
         
-        print("\n正在处理 '首充复登' sheet...")
+        # 3. 首充复登
+        print("\nProcessing 'First Pay Login Retention' sheet...")
         if (login_data := generate_retention_data(login_return_files)) is not None and not login_data.empty:
             summary_cols_login = ['次日', '3日', '4日', '5日', '6日', '7日']
             format_retention_sheet(writer, login_data, '首充复登', summary_cols_login)
-            print("- '首充复登' sheet 已写入并格式化。")
+            print("- 'First Pay Login Retention' sheet written and formatted.")
+            
+            # 保存首充人数数据，供首充复充使用
+            first_pay_data = login_data[['时间', '首充人数']].copy() if '首充人数' in login_data.columns else None
+        else:
+            first_pay_data = None
 
-        print("\n正在处理 '首充复充' sheet...")
-        if (recharge_data := generate_retention_data(recharge_return_files)) is not None and not recharge_data.empty:
+        # 4. 首充复充
+        print("\nProcessing 'First Pay Recharge Retention' sheet...")
+        # 首充复充使用中文命名的文件
+        recharge_recharge_files = find_files("用户留存率_首充复充_*全平台*.csv")
+        if not recharge_recharge_files:
+            recharge_recharge_files = find_files("*首充复充*全平台*.csv")
+        
+        if (recharge_data := generate_retention_data(recharge_recharge_files)) is not None and not recharge_data.empty:
+            # 如果首充复登有首充人数数据，使用相同的数据
+            if first_pay_data is not None and '首充人数' in recharge_data.columns:
+                print("  Using first pay login retention data to ensure consistency")
+                recharge_data = recharge_data.drop('首充人数', axis=1)
+                recharge_data = recharge_data.merge(first_pay_data, on='时间', how='left')
+            
             summary_cols_recharge = ['次日', '3日', '4日', '5日', '6日', '7日', '30日']
             format_retention_sheet(writer, recharge_data, '首充复充', summary_cols_recharge)
-            print("- '首充复充' sheet 已写入并格式化。")
+            print("- 'First Pay Recharge Retention' sheet written and formatted.")
             
-        print("\n正在处理 '消耗' sheet...")
-        if (consumption_data := generate_consumption_data(consumption_files, CHANNEL_RULES)) is not None and not consumption_data.empty:
+        # 5. 赠送类型统计
+        print("\n正在处理 '赠送类型统计' sheet...")
+        if gift_stats_files:
+            try:
+                gift_data_list = []
+                for file in gift_stats_files:
+                    try:
+                        df = pd.read_csv(file, encoding='utf-8')
+                    except:
+                        try:
+                            df = pd.read_csv(file, encoding='gbk')
+                        except:
+                            df = pd.read_csv(file, encoding='latin-1')
+                    
+                    print(f"  - 加载 {os.path.basename(file)}: {df.shape}")
+                    print(f"    列名: {list(df.columns)}")
+                    gift_data_list.append(df)
+                
+                if gift_data_list:
+                    # 合并数据
+                    gift_combined = pd.concat(gift_data_list, ignore_index=True)
+                    
+                    # 创建标准化的赠送类型统计表
+                    workbook = writer.book
+                    ws = workbook.create_sheet(title='赠送类型统计')
+                    
+                    # 设置表头 - A列是日期列
+                    headers = ['日期', '赠送类型', '赠送数量', '赠送金额', '备注']
+                    for col_idx, header in enumerate(headers, 1):
+                        ws.cell(row=1, column=col_idx).value = header
+                    
+                    # 写入数据
+                    row = 2
+                    for file in gift_stats_files:
+                        # 从文件名中提取日期
+                        filename = os.path.basename(file)
+                        date_from_filename = None
+                        
+                        # 尝试从文件名中提取日期 (格式: 赠送类型统计2025-10-17.csv)
+                        date_match = re.search(r'(\d{4}-\d{1,2}-\d{1,2})', filename)
+                        if date_match:
+                            date_from_filename = date_match.group(1)
+                            print(f"  Extracted date from filename: {date_from_filename}")
+                        
+                        # 读取该文件的数据
+                        try:
+                            df = pd.read_csv(file, encoding='utf-8')
+                        except:
+                            try:
+                                df = pd.read_csv(file, encoding='gbk')
+                            except:
+                                df = pd.read_csv(file, encoding='latin-1')
+                        
+                        # 为每一行数据写入日期
+                        for _, data_row in df.iterrows():
+                            # A列：日期（优先使用文件名中的日期）
+                            date_val = date_from_filename or data_row.get('日期') or data_row.get('时间') or datetime.now().strftime('%Y-%m-%d')
+                            ws.cell(row=row, column=1).value = date_val
+                            
+                            # 其他列：根据实际数据结构填充
+                            for col_idx, header in enumerate(headers[1:], 2):
+                                value = data_row.get(header) or data_row.get(header.replace('赠送', '')) or ''
+                                ws.cell(row=row, column=col_idx).value = value
+                            
+                            row += 1
+                    
+                    print("- '赠送类型统计' sheet 已写入并格式化。")
+            except Exception as e:
+                print(f"  处理赠送类型统计时出错: {e}")
+        else:
+            print("  - 未找到赠送类型统计文件")
+        
+        # 6. LTV
+        print("\n正在处理 'LTV' sheet...")
+        # LTV相关文件
+        ltv_files = find_files("download_ltv_*.csv")
+        print(f"LTV文件:")
+        print(f"  - 找到 {len(ltv_files)} 个LTV文件")
+        
+        # 按渠道分类LTV文件
+        ltv_platform_files = [f for f in ltv_files if '全平台' in f]
+        ltv_channel_files = [f for f in ltv_files if '全平台' not in f]
+        
+        # Build channel code to category mapping
+        code_to_category = {}
+        for rule in CHANNEL_RULES:
+            code_to_category[rule['代码']] = rule['分类']
+        
+        # 按渠道类型分类（根据渠道代号直接分类）
+        sms_ltv_files = []
+        influencer_ltv_files = []
+        ad_ltv_files = []
+        
+        for f in ltv_channel_files:
+            basename = os.path.basename(f)
+            # Extract channel code (e.g., 1102, 1103, 1104, etc.)
+            match = re.search(r'download_ltv_(\d+)', basename)
+            if match:
+                channel_code = match.group(1)
+                # Check channel code in CHANNEL_RULES to determine category
+                category = code_to_category.get(channel_code)
+                
+                if category == '短信':
+                    sms_ltv_files.append(f)
+                    print(f"    SMS LTV file: {basename} (code: {channel_code})")
+                elif category == '网红':
+                    influencer_ltv_files.append(f)
+                    print(f"    Influencer LTV file: {basename} (code: {channel_code})")
+                elif category == '投放':
+                    ad_ltv_files.append(f)
+                    print(f"    Ad LTV file: {basename} (code: {channel_code})")
+        
+        print(f"  - Full platform LTV: {len(ltv_platform_files)} files")
+        print(f"  - SMS LTV: {len(sms_ltv_files)} files")
+        print(f"  - Influencer LTV: {len(influencer_ltv_files)} files")
+        print(f"  - Ad LTV: {len(ad_ltv_files)} files")
+        
+        if ltv_platform_files:
+            # 生成全平台LTV sheet
+            try:
+                # Only process files with current or previous month in filename
+                filtered_ltv_platform_files = [f for f in ltv_platform_files if '本月' in f or '上月' in f]
+                print(f"  - Filtered to {len(filtered_ltv_platform_files)} platform files (current and previous month only)")
+                
+                ltv_data_list = []
+                for file in filtered_ltv_platform_files:
+                    try:
+                        df = pd.read_csv(file, encoding='utf-8')
+                        ltv_data_list.append(df)
+                    except:
+                        try:
+                            df = pd.read_csv(file, encoding='gbk')
+                            ltv_data_list.append(df)
+                        except:
+                            df = pd.read_csv(file, encoding='latin-1')
+                            ltv_data_list.append(df)
+                
+                if ltv_data_list:
+                    ltv_combined = pd.concat(ltv_data_list, ignore_index=True)
+                    
+                    # Deduplicate by time, keep the last one (current month takes precedence)
+                    if '时间' in ltv_combined.columns:
+                        ltv_combined = ltv_combined.drop_duplicates(subset=['时间'], keep='last')
+                        print(f"  - After deduplication: {len(ltv_combined)} rows")
+                        ltv_combined = ltv_combined.sort_values('时间')
+                    
+                    # 使用专门的平台LTV格式化函数（简化表头，只有14/30/60日）
+                    format_platform_ltv_sheet(writer, ltv_combined, 'LTV')
+                    print("  - 'LTV' (Platform) sheet written with formatted headers.")
+            except Exception as e:
+                print(f"  Error processing LTV platform files: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 7. 消耗
+        print("\nProcessing 'Consumption' sheet...")
+        # 合并所有LTV文件用于消耗数据提取，但只使用本月和上月的文件
+        all_ltv_files = sms_ltv_files + influencer_ltv_files + ad_ltv_files
+        filtered_consumption_files = [f for f in all_ltv_files if '本月' in f or '上月' in f]
+        print(f"  - Using {len(filtered_consumption_files)} LTV files for consumption data (current and previous month only)")
+        
+        if (consumption_data := generate_consumption_data(filtered_consumption_files, CHANNEL_RULES)) is not None and not consumption_data.empty:
             format_consumption_sheet(writer, consumption_data, CHANNEL_RULES)
-            print("- '消耗' sheet 已写入并格式化。")
+            print("- 'Consumption' sheet written and formatted.")
+        else:
+            print("  - No consumption data found")
 
-        print("\n正在处理 '每日渠道消耗' sheet...")
+        # 8. 每日渠道统计
+        print("\nProcessing 'Daily Channel Statistics' sheet...")
         def format_daily_channel_sheet(writer, df):
             workbook = writer.book
-            ws = workbook.create_sheet(title='每日渠道消耗')
+            ws = workbook.create_sheet(title='每日渠道统计')
             headers = ['日期', '总代号', '总代名', '方式', '投放方式', '一级首充人数', '首充金额', '首充人数', '非首充充值金额', '非首充人数', '分组名称', '当日消耗($)', '访问量', '新增用户', '老用户登陆', '活跃', '新增成本', '首充付费人数', '付费/首充成本', '注册复登', '首充复登', '首充复充', '分组名称', '首充（首充人均）', '一级首充', '非首充（老用户人均）', '新增充值（充值人均)', '一级新充', '裂变占比', '新增/首充率', '老用户充值', '活跃充值', '提现人数', '提现金额', '提现率', '首充提现率(人数)', '首充提现率(金额)', '老用户付费率', '老用户付费占比', '活跃付费率', 'ARPU', '分组名称', '充值金額', '总提现', '充提差', '新增充值ROAS', '老用户充值ROAS', '总充值ROI', '当日回本ROI']
             for c_idx, h in enumerate(headers, 1):
                 ws.cell(row=1, column=c_idx).value = h
@@ -1047,10 +1677,12 @@ def main():
             start_row = 2
             for r_offset, (_, row) in enumerate(df.iterrows(), 0):
                 r = start_row + r_offset
-                # 日期：若缺失，默认次日
+                # 日期：优先使用数据中的日期，如果缺失则使用从文件名提取的日期
                 date_val = row.get('日期')
                 if not isinstance(date_val, str) or not date_val:
-                    date_val = (datetime.today() + timedelta(days=1)).strftime('%#d/%#m/%Y')
+                    # 如果数据中没有日期，尝试从文件名获取
+                    # 这里需要传递文件名信息，暂时使用当前日期
+                    date_val = datetime.now().strftime('%#d/%#m/%Y')
                 ws.cell(row=r, column=col_idx_map['日期']).value = date_val
                 # 直接写入的字段（解析自分组名称的列）
                 ws.cell(row=r, column=col_idx_map['总代号']).value = row.get('总代号', '')
@@ -1099,423 +1731,317 @@ def main():
         daily_channel_data = generate_daily_channel_sheet(daily_q_files, daily_u_files, daily_e_files)
         if daily_channel_data is not None and not daily_channel_data.empty:
             format_daily_channel_sheet(writer, daily_channel_data)
-            print("- '每日渠道消耗' sheet 已写入并格式化。")
+            print("- 'Daily Channel Statistics' sheet written and formatted.")
+        else:
+            print("  - No daily channel statistics data found")
         
-        # 渠道首充复登
-        print("\n正在处理 '渠道首充复登' sheet...")
-        def format_channel_retention_sheet(writer, files, sheet_name, summary_days):
-            workbook = writer.book
-            ws = workbook.create_sheet(title=sheet_name)
-            
-            # 按截图格式设置表头
-            # 第一行：时间、首充人数、留存率（合并到7日）、方式、总代号、时间、首充人数、留存率（合并到30日）
-            ws.cell(row=1, column=1).value = '时间'
-            ws.cell(row=1, column=2).value = '首充人数'
-            ws.merge_cells(start_row=1, start_column=3, end_row=1, end_column=6)  # 留存率合并到7日
-            ws.cell(row=1, column=3).value = '留存率'
-            ws.cell(row=1, column=7).value = '方式'
-            ws.cell(row=1, column=8).value = '总代号'
-            ws.cell(row=1, column=9).value = '时间'
-            ws.cell(row=1, column=10).value = '首充人数'
-            ws.merge_cells(start_row=1, start_column=11, end_row=1, end_column=17)  # 留存率合并到30日
-            ws.cell(row=1, column=11).value = '留存率'
-            
-            # 第二行：具体列名
-            # 左侧：时间、首充人数、次日、3日、7日、30日、方式、总代号
-            # 右侧：时间、首充人数、次日、3日、4日、5日、6日、7日、30日
-            left_headers = ['时间', '首充人数', '次日', '3日', '7日', '30日', '方式', '总代号']
-            right_headers = ['时间', '首充人数', '次日', '3日', '4日', '5日', '6日', '7日', '30日']
-            
-            for i, h in enumerate(left_headers, 1):
-                ws.cell(row=2, column=i).value = h
-            for i, h in enumerate(right_headers, 9):
-                ws.cell(row=2, column=i).value = h
-
-            # 按总代号分组处理文件
-            agent_groups = {}
-            for fp in files:
+        # 9. 渠道首充复登
+        print("\nProcessing 'Channel First Pay Login Retention' sheet...")
+        if channel_login_files:  # 使用 recharge_return 文件作为首充复登数据源
+            # 获取全平台留存文件中的首充人数数据
+            platform_login_files = [f for f in login_return_files if '全平台' in f]
+            first_pay_mapping = {}
+            if platform_login_files:
+                print(f"  Using platform login data for first pay count: {len(platform_login_files)} files")
+                # 读取全平台留存文件获取首充人数
                 try:
-                    basename = os.path.basename(fp)
-                    print(f"  处理文件: {basename}")
-                    # 提取总代号：download_first_login_return_1102 _ TL_333_XXX_AAA_DP_本月_2025-10-16
-                    m = re.search(r'download_first_(?:login|recharge)_return_(\d+)\s*_', basename)
-                    if not m:
-                        print(f"    跳过文件（无法提取总代号）: {basename}")
-                        continue
-                    agent_code = m.group(1)
-                    if agent_code not in agent_groups:
-                        agent_groups[agent_code] = []
-                    agent_groups[agent_code].append(fp)
-                    print(f"    总代号: {agent_code}")
+                    platform_df = pd.read_csv(platform_login_files[0], encoding='utf-8')
+                    if '首充人数' in platform_df.columns and '时间' in platform_df.columns:
+                        first_pay_mapping = dict(zip(platform_df['时间'], platform_df['首充人数']))
+                        print(f"  First pay mapping created with {len(first_pay_mapping)} entries")
+                    else:
+                        first_pay_mapping = {}
                 except Exception as e:
-                    print(f"    处理文件出错: {e}")
-                    continue
+                    print(f"  Error reading platform login file: {e}")
+                    first_pay_mapping = {}
+            else:
+                first_pay_mapping = {}
             
-            print(f"  找到 {len(agent_groups)} 个总代号组")
-
-            # 从CHANNEL_RULES获取总代名、方式、投放方式
-            code_to_info = {rule['代码']: rule for rule in CHANNEL_RULES}
-
-            row = 3
-            for agent_code in sorted(agent_groups.keys()):
-                agent_files = agent_groups[agent_code]
-                info = code_to_info.get(agent_code, {})
-                agent_name = info.get('名称', f'未知_{agent_code}')
-                method = info.get('分类', '其他')
-
-                # 合并该总代号的所有文件
-                try:
-                    dfs = []
-                    for fp in agent_files:
-                        df = pd.read_csv(fp, engine='python', on_bad_lines='skip', encoding='utf-8')
-                        df.columns = df.columns.str.strip()
-                        # 过滤掉汇总行
-                        df = df[~df['时间'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
-                        df['时间'] = pd.to_datetime(df['时间'], errors='coerce')
-                        df.dropna(subset=['时间'], inplace=True)
-                        if not df.empty:
-                            dfs.append(df)
-                    if not dfs:
-                        continue
-                    merged = pd.concat(dfs, ignore_index=True)
-                    # 按日期去重，保留最后一条
-                    merged = merged.sort_values('时间').drop_duplicates(subset=['时间'], keep='last')
-                    merged = merged.sort_values('时间')
-
-                    # 写入数据行
-                    for _, r in merged.iterrows():
-                        date_str = r['时间'].strftime('%#d/%#m/%Y') if hasattr(r['时间'], 'strftime') else str(r['时间'])
-                        
-                        # 左侧汇总部分
-                        ws.cell(row=row, column=1).value = date_str
-                        ws.cell(row=row, column=2).value = r.get('首充人数', '')
-                        ws.cell(row=row, column=7).value = method
-                        ws.cell(row=row, column=8).value = agent_code
-                        
-                        # 右侧详细部分
-                        ws.cell(row=row, column=9).value = date_str
-                        ws.cell(row=row, column=10).value = r.get('首充人数', '')
-
-                        # 直接从数据中提取百分比（从"百分比 / 人数"格式中提取百分比部分）
-                        def extract_percent_from_data(col_name):
-                            if col_name in r and pd.notna(r[col_name]):
-                                val = str(r[col_name]).strip()
-                                if '/' in val:
-                                    return val.split('/')[0].strip()
-                                return val
-                            return ""
-
-                        # 左侧汇总列（3-6列：次日、3日、7日、30日）
-                        summary_cols = ['次日', '3日', '7日', '30日']
-                        for i, col_name in enumerate(summary_cols, 3):
-                            percent_val = extract_percent_from_data(col_name)
-                            if percent_val:
-                                ws.cell(row=row, column=i).value = percent_val
-
-                        # 右侧详细列（11-17列：次日、3日、4日、5日、6日、7日、30日）
-                        detail_cols = ['次日', '3日', '4日', '5日', '6日', '7日', '30日']
-                        for i, col_name in enumerate(detail_cols, 11):
-                            percent_val = extract_percent_from_data(col_name)
-                            if percent_val:
-                                ws.cell(row=row, column=i).value = percent_val
-                        
-                        row += 1
-                except Exception as e:
-                    print(f"处理总代号 {agent_code} 时出错: {e}")
-                    continue
-
-        if channel_login_files:
-            format_channel_retention_sheet(writer, channel_login_files, '渠道首充复登', ['次日', '3日', '7日', '30日'])
-            print("- '渠道首充复登' sheet 已写入并格式化。")
-
-        # 渠道首充复充
+            format_channel_retention_sheet(writer, channel_login_files, '渠道首充复登', ['次日', '3日', '7日', '30日'], first_pay_mapping)
+            print("- 'Channel First Pay Login Retention' sheet written and formatted.")
+        else:
+            print("  - No channel login retention files found")
+        
+        # 10. 渠道首充复充
         print("\n正在处理 '渠道首充复充' sheet...")
-        if channel_recharge_files:
+        if channel_recharge_files:  # 使用 用户留存率_首充复充 文件
             format_channel_retention_sheet(writer, channel_recharge_files, '渠道首充复充', ['次日', '3日', '7日', '30日'])
             print("- '渠道首充复充' sheet 已写入并格式化。")
+        else:
+            print("  - No channel recharge retention files found for 渠道首充复充")
         
-        # LTV相关文件
-        ltv_files = find_files("download_ltv_*.csv")
-        print(f"LTV文件:")
-        print(f"  - 找到 {len(ltv_files)} 个LTV文件")
-        
-        # 按渠道分类LTV文件
-        ltv_platform_files = [f for f in ltv_files if '全平台' in f]
-        ltv_channel_files = [f for f in ltv_files if '全平台' not in f]
-        
-        # 按渠道类型分类（根据文件名中的映射代码）
-        sms_ltv_files = []
-        influencer_ltv_files = []
-        ad_ltv_files = []
-        
-        for f in ltv_channel_files:
-            basename = os.path.basename(f)
-            # 根据映射规则分类：333=短信，222=网红，111=投放
-            # 只处理LTV文件
-            if 'download_ltv_' in basename:
-                if '_333_' in basename:  # 短信群发类
-                    sms_ltv_files.append(f)
-                    print(f"    短信LTV文件: {basename}")
-                elif '_222_' in basename:  # 网红
-                    influencer_ltv_files.append(f)
-                    print(f"    网红LTV文件: {basename}")
-                elif '_111_' in basename:  # 投放
-                    ad_ltv_files.append(f)
-                    print(f"    投放LTV文件: {basename}")
-        
-        print(f"  - 全平台LTV: {len(ltv_platform_files)} 个")
-        print(f"  - 短信LTV: {len(sms_ltv_files)} 个")
-        print(f"  - 网红LTV: {len(influencer_ltv_files)} 个")
-        print(f"  - 投放LTV: {len(ad_ltv_files)} 个")
-        
-        # 详细列出每个分类的文件
-        print("  短信LTV文件列表:")
-        for f in sms_ltv_files:
-            print(f"    {os.path.basename(f)}")
-        print("  网红LTV文件列表:")
-        for f in influencer_ltv_files:
-            print(f"    {os.path.basename(f)}")
-        print("  投放LTV文件列表:")
-        for f in ad_ltv_files:
-            print(f"    {os.path.basename(f)}")
-        
-        # LTV表处理函数
-        def format_ltv_sheet(writer, files, sheet_name, is_platform=False):
-            workbook = writer.book
-            ws = workbook.create_sheet(title=sheet_name)
-            
-            if is_platform:
-                # 全平台LTV表头
-                headers = ['14日辅助列', '30日辅助列', '时间', '消耗', '新增用户', '新增用户单价', '首充人数', 
-                          '14日LTV', '', '30日LTV', '', '60日LTV', '']
-                sub_headers = ['', '', '', '', '', '', '', '金额', '付费用户数', '金额', '付费用户数', '金额', '付费用户数']
-            else:
-                # 渠道LTV表头
-                headers = ['14日辅助列', '30日辅助列', '时间', '消耗', '新增用户', '新增用户单价', '首充人数', 
-                          '付费率', '注册复登', '首充复登', '3日注册复登', '3日首充复登', '首充成本',
-                          '首日LTV', '', '2日LTV', '', '3日LTV', '', '7日LTV', '', '14日LTV', '', '30日LTV', '', '60日LTV', '']
-                sub_headers = ['', '', '', '', '', '', '', '', '', '', '', '', '', 
-                              '金额', '付费用户数', '金额', '付费用户数', '金额', '付费用户数', '金额', '', '金额', '付费用户数', '金额', '付费用户数', '金额', '付费用户数']
-            
-            # 写入表头
-            for i, h in enumerate(headers, 1):
-                ws.cell(row=1, column=i).value = h
-            for i, h in enumerate(sub_headers, 1):
-                ws.cell(row=2, column=i).value = h
-            
-            # 合并单元格
-            if is_platform:
-                ws.merge_cells(start_row=1, start_column=8, end_row=1, end_column=9)   # 14日LTV
-                ws.merge_cells(start_row=1, start_column=10, end_row=1, end_column=11)  # 30日LTV
-                ws.merge_cells(start_row=1, start_column=12, end_row=1, end_column=13)  # 60日LTV
-            else:
-                # 渠道LTV合并单元格
-                ltv_columns = [(14, 15), (16, 17), (18, 19), (20, 21), (22, 23), (24, 25), (26, 27)]
-                for start_col, end_col in ltv_columns:
-                    ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=end_col)
-            
-            if not files:
-                return
-            
-            # 处理数据
-            all_data = []
-            print(f"    开始处理 {len(files)} 个文件...")
-            for i, fp in enumerate(files):
-                try:
-                    basename = os.path.basename(fp)
-                    df = pd.read_csv(fp, engine='python', on_bad_lines='skip', encoding='utf-8')
-                    df.columns = df.columns.str.strip()
-                    print(f"    文件{i+1}: {basename}")
-                    print(f"      列名: {list(df.columns)}")
-                    # 过滤掉汇总行
-                    df = df[~df['时间'].astype(str).str.contains('数据汇总|总计', na=False, regex=True)].copy()
-                    df['时间'] = pd.to_datetime(df['时间'], errors='coerce')
-                    df.dropna(subset=['时间'], inplace=True)
-                    if not df.empty:
-                        # 检查消耗列的数据
-                        if '消耗' in df.columns:
-                            print(f"      消耗列示例数据: {df['消耗'].head(3).tolist()}")
-                        all_data.append(df)
-                        print(f"      有效数据行数: {len(df)}")
-                except Exception as e:
-                    print(f"    读取LTV文件出错: {e}")
-                    continue
-            
-            if not all_data:
-                return
-            
-            # 对于渠道LTV，需要按日期汇总数据，而不是简单合并
-            if is_platform:
-                merged = pd.concat(all_data, ignore_index=True)
-                merged = merged.sort_values('时间').drop_duplicates(subset=['时间'], keep='last')
-                merged = merged.sort_values('时间')
-            else:
-                # 渠道LTV：按日期汇总所有渠道的数据
-                merged = pd.concat(all_data, ignore_index=True)
-                
-                # 只对LTV相关的数值列进行汇总，保留其他字段
-                ltv_numeric_cols = ['金额', '付费用户数', '金额.1', '付费用户数.1', 
-                                   '金额.2', '付费用户数.2', '金额.3', 'Unnamed: 18', '金额.4', '付费用户数.3', 
-                                   '金额.5', '付费用户数.4', '金额.6', '付费用户数.5']
-                
-                # 确保LTV数值列是数值类型，处理$符号
-                for col in ltv_numeric_cols:
-                    if col in merged.columns:
-                        # 处理金额列中的$符号
-                        if '金额' in col:
-                            merged[col] = pd.to_numeric(merged[col].astype(str).str.replace('$', ''), errors='coerce').fillna(0)
-                            # 四舍五入到2位小数，避免浮点数精度问题
-                            merged[col] = merged[col].round(2)
-                        else:
-                            merged[col] = pd.to_numeric(merged[col], errors='coerce').fillna(0)
-                
-                # 先处理消耗列，去除$符号并转换为数值
-                if '消耗' in merged.columns:
-                    merged['消耗'] = pd.to_numeric(merged['消耗'].astype(str).str.replace('$', ''), errors='coerce').fillna(0)
-                if '新增用户' in merged.columns:
-                    merged['新增用户'] = pd.to_numeric(merged['新增用户'], errors='coerce').fillna(0)
-                if '首充人数' in merged.columns:
-                    merged['首充人数'] = pd.to_numeric(merged['首充人数'], errors='coerce').fillna(0)
-                
-                # 按日期分组，对LTV数值列求和，其他列取第一个值
-                agg_dict = {}
-                for col in merged.columns:
-                    if col == '时间':
-                        continue
-                    elif col in ltv_numeric_cols:
-                        agg_dict[col] = 'sum'
-                    elif col in ['消耗', '新增用户', '首充人数']:
-                        agg_dict[col] = 'sum'
-                    else:
-                        agg_dict[col] = 'first'
-                
-                # print(f"    汇总前数据行数: {len(merged)}")
-                # print(f"    消耗列示例数据: {merged['消耗'].head(3).tolist()}")
-                
-                merged = merged.groupby('时间').agg(agg_dict).reset_index()
-                merged = merged.sort_values('时间')
-                
-                # 对金额列再次进行四舍五入，确保没有浮点数精度问题
-                for col in ltv_numeric_cols:
-                    if col in merged.columns and '金额' in col:
-                        merged[col] = merged[col].round(2)
-                
-                # print(f"    汇总后数据行数: {len(merged)}")
-                # print(f"    汇总后消耗列示例: {merged['消耗'].head(3).tolist()}")
-            
-            # 写入数据
-            row = 3
-            # print(f"    开始写入数据，共{len(merged)}行")
-            for idx, (_, r) in enumerate(merged.iterrows()):
-                date_str = r['时间'].strftime('%#d/%#m/%Y') if hasattr(r['时间'], 'strftime') else str(r['时间'])
-                # if idx < 3:  # 只打印前3行的调试信息
-                #     print(f"    第{idx+1}行数据: 日期={date_str}, 消耗={r.get('消耗', '')}")
-                
-                # 基础字段
-                ws.cell(row=row, column=3).value = date_str
-                ws.cell(row=row, column=4).value = r.get('消耗', '')
-                ws.cell(row=row, column=5).value = r.get('新增用户', '')
-                ws.cell(row=row, column=6).value = r.get('新增用户单价', '')
-                ws.cell(row=row, column=7).value = r.get('首充人数', '')
-                
-                if not is_platform:
-                    # 渠道特有字段
-                    ws.cell(row=row, column=8).value = r.get('付费率', '')
-                    ws.cell(row=row, column=9).value = r.get('注册复登', '')
-                    ws.cell(row=row, column=10).value = r.get('首充复登', '')
-                    ws.cell(row=row, column=11).value = r.get('3日注册复登', '')
-                    ws.cell(row=row, column=12).value = r.get('3日首充复登', '')
-                    ws.cell(row=row, column=13).value = r.get('首充成本', '')
-                
-                # LTV数据提取
-                def extract_ltv_data(col_name, amount_col, user_col):
-                    # 根据实际的CSV列名映射（pandas会自动重命名重复列名）
-                    col_mapping = {
-                        '首日': ('金额', '付费用户数'),           # 第11,12列
-                        '2日': ('金额.1', '付费用户数.1'),        # 第13,14列  
-                        '3日': ('金额.2', '付费用户数.2'),        # 第15,16列
-                        '7日': ('金额.3', 'Unnamed: 18'),        # 第17,18列
-                        '14日': ('金额.4', '付费用户数.3'),       # 第19,20列
-                        '30日': ('金额.5', '付费用户数.4'),       # 第21,22列
-                        '60日': ('金额.6', '付费用户数.5')        # 第23,24列
-                    }
-                    
-                    if col_name in col_mapping:
-                        amount_col_name, user_col_name = col_mapping[col_name]
-                        
-                        # 获取原始值
-                        amount_val = r.get(amount_col_name, '') if amount_col_name in r else ''
-                        user_val = r.get(user_col_name, '') if user_col_name in r else ''
-                        
-                        # 转换为字符串并清理
-                        amount_str = str(amount_val).strip() if amount_val is not None else ''
-                        user_str = str(user_val).strip() if user_val is not None else ''
-                        
-                        if row == 3:  # 调试信息
-                            print(f"    {col_name}LTV: 查找列={amount_col_name},{user_col_name}, 金额={amount_str}, 用户数={user_str}")
-                        
-                        return amount_str, user_str
-                    return "", ""
-                
-                if is_platform:
-                    # 全平台LTV：14日、30日、60日
-                    ltv_days = [('14日', 8, 9), ('30日', 10, 11), ('60日', 12, 13)]
-                    for ltv_name, amount_col, user_col in ltv_days:
-                        amount, users = extract_ltv_data(ltv_name, amount_col, user_col)
-                        # if row == 3:  # 只打印第一行的调试信息
-                        #     print(f"    {ltv_name}LTV: 金额={amount}, 用户数={users}")
-                        ws.cell(row=row, column=amount_col).value = amount
-                        ws.cell(row=row, column=user_col).value = users
-                else:
-                    # 渠道LTV：首日、2日、3日、7日、14日、30日、60日
-                    ltv_days = [('首日', 14, 15), ('2日', 16, 17), ('3日', 18, 19), 
-                               ('7日', 20, 21), ('14日', 22, 23), ('30日', 24, 25), ('60日', 26, 27)]
-                    for ltv_name, amount_col, user_col in ltv_days:
-                        amount, users = extract_ltv_data(ltv_name, amount_col, user_col)
-                        # if row == 3:  # 只打印第一行的调试信息
-                        #     print(f"    {ltv_name}LTV: 金额={amount}, 用户数={users}")
-                        ws.cell(row=row, column=amount_col).value = amount
-                        ws.cell(row=row, column=user_col).value = users
-                
-                row += 1
-            
-            # 添加辅助列公式
-            if is_platform:
-                # 全平台LTV辅助列公式
-                ws.cell(row=1, column=1).value = "=SUM(A3:A9990)/SUMIFS(G3:G9990,W3:W9990,\"<>\")"  # 14日辅助列
-                ws.cell(row=1, column=2).value = "=SUM(B3:B9990)/SUMIFS(G3:G9990,Y3:Y9990,\"<>\")"  # 30日辅助列
-            else:
-                # 渠道LTV辅助列公式
-                ws.cell(row=1, column=1).value = "=SUM(A3:A10000)/SUMIFS(G3:G10000,W3:W10000,\"<>\")"  # 14日辅助列
-                ws.cell(row=1, column=2).value = "=SUM(B3:B10000)/SUMIFS(G3:G10000,Y3:Y10000,\"<>\")"  # 30日辅助列
-        
-        # 处理各个LTV表
-        if ltv_platform_files:
-            print("\n正在处理 'LTV' sheet...")
-            format_ltv_sheet(writer, ltv_platform_files, 'LTV', is_platform=True)
-            print("- 'LTV' sheet 已写入并格式化。")
-        
+        # 11. 短信LTV - 按渠道分别去重后按日期合并
+        print("\nProcessing 'SMS LTV' sheet...")
         if sms_ltv_files:
-            print("\n正在处理 '短信LTV' sheet...")
-            format_ltv_sheet(writer, sms_ltv_files, '短信LTV', is_platform=False)
-            print("- '短信LTV' sheet 已写入并格式化。")
+            try:
+                # Only process files with current or previous month in filename
+                filtered_sms_files = [f for f in sms_ltv_files if '本月' in f or '上月' in f]
+                print(f"  - Filtered to {len(filtered_sms_files)} files (current and previous month only)")
+                
+                # Group by channel code
+                channel_data = {}
+                for file in filtered_sms_files:
+                    basename = os.path.basename(file)
+                    match = re.search(r'download_ltv_(\d+)', basename)
+                    if match:
+                        channel_code = match.group(1)
+                        if channel_code not in channel_data:
+                            channel_data[channel_code] = []
+                        
+                        print(f"    Processing SMS LTV file for channel {channel_code}")
+                    try:
+                        df = pd.read_csv(file, encoding='utf-8')
+                    except:
+                        try:
+                            df = pd.read_csv(file, encoding='gbk')
+                        except:
+                            df = pd.read_csv(file, encoding='latin-1')
+                        df.columns = df.columns.str.strip()
+                        channel_data[channel_code].append(df)
+                
+                # Deduplicate each channel separately, then combine
+                all_channel_dfs = []
+                for channel_code, dfs in channel_data.items():
+                    if dfs:
+                        channel_df = pd.concat(dfs, ignore_index=True)
+                        if '时间' in channel_df.columns:
+                            channel_df = channel_df.drop_duplicates(subset=['时间'], keep='last')
+                            print(f"  - Channel {channel_code}: {len(channel_df)} rows after deduplication")
+                        all_channel_dfs.append(channel_df)
+                
+                if all_channel_dfs:
+                    sms_ltv_combined = pd.concat(all_channel_dfs, ignore_index=True)
+                    
+                    if '时间' in sms_ltv_combined.columns:
+                        # 排除时间列和LTV标签列
+                        ltv_label_cols = ['首日LTV', '2日LTV', '3日LTV', '7日LTV', '14日LTV', '30日LTV', '60日LTV']
+                        numeric_cols = []
+                        
+                        for col in sms_ltv_combined.columns:
+                            if col != '时间' and col not in ltv_label_cols:
+                                try:
+                                    sms_ltv_combined[col] = pd.to_numeric(
+                                        sms_ltv_combined[col].astype(str).str.replace('$', '').str.replace('%', '').str.replace(',', ''), 
+                                        errors='coerce'
+                                    )
+                                    if sms_ltv_combined[col].dtype in ['int64', 'float64']:
+                                        numeric_cols.append(col)
+                                except:
+                                    pass
+                        
+                        print(f"  - Found {len(numeric_cols)} numerical columns to sum")
+                        if len(numeric_cols) > 0:
+                            print(f"  - Sample numeric columns: {numeric_cols[:5]}")
+                        
+                        if numeric_cols:
+                            # 保存非数值列（LTV标签列等）
+                            non_numeric_cols = [col for col in sms_ltv_combined.columns if col not in numeric_cols and col != '时间']
+                            
+                            # Group by time and sum数值列
+                            sms_ltv_summed = sms_ltv_combined.groupby('时间', as_index=False)[numeric_cols].sum()
+                            
+                            # 合并非数值列（取first）
+                            if non_numeric_cols:
+                                non_numeric_data = sms_ltv_combined.groupby('时间', as_index=False)[non_numeric_cols].first()
+                                sms_ltv_combined = pd.merge(sms_ltv_summed, non_numeric_data, on='时间', how='left')
+                            else:
+                                sms_ltv_combined = sms_ltv_summed
+                            
+                            print(f"  - After grouping: {len(sms_ltv_combined)} rows, {len(sms_ltv_combined.columns)} columns")
+                        else:
+                            sms_ltv_combined = sms_ltv_combined.drop_duplicates(subset=['时间'], keep='last')
+                            print(f"  - After deduplication: {len(sms_ltv_combined)} rows")
+                        
+                        sms_ltv_combined = sms_ltv_combined.sort_values('时间')
+                    
+                    format_ltv_sheet_with_headers(writer, sms_ltv_combined, '短信LTV')
+                    print("  - 'SMS LTV' sheet written with formatted headers.")
+            except Exception as e:
+                print(f"  Error processing SMS LTV files: {e}")
+                import traceback
+                traceback.print_exc()
         
+        # 12. 网红LTV - 按渠道分别去重后按日期合并
+        print("\nProcessing 'Influencer LTV' sheet...")
         if influencer_ltv_files:
-            print("\n正在处理 '网红LTV' sheet...")
-            format_ltv_sheet(writer, influencer_ltv_files, '网红LTV', is_platform=False)
-            print("- '网红LTV' sheet 已写入并格式化。")
+            try:
+                # Only process files with current or previous month in filename
+                filtered_influencer_files = [f for f in influencer_ltv_files if '本月' in f or '上月' in f]
+                print(f"  - Filtered to {len(filtered_influencer_files)} files (current and previous month only)")
+                
+                # Group by channel code
+                channel_data = {}
+                for file in filtered_influencer_files:
+                    basename = os.path.basename(file)
+                    match = re.search(r'download_ltv_(\d+)', basename)
+                    if match:
+                        channel_code = match.group(1)
+                        if channel_code not in channel_data:
+                            channel_data[channel_code] = []
+                        
+                        print(f"    Processing Influencer LTV file for channel {channel_code}")
+                    try:
+                        df = pd.read_csv(file, encoding='utf-8')
+                    except:
+                        try:
+                            df = pd.read_csv(file, encoding='gbk')
+                        except:
+                            df = pd.read_csv(file, encoding='latin-1')
+                        df.columns = df.columns.str.strip()
+                        channel_data[channel_code].append(df)
+                
+                # Deduplicate each channel separately, then combine
+                all_channel_dfs = []
+                for channel_code, dfs in channel_data.items():
+                    if dfs:
+                        channel_df = pd.concat(dfs, ignore_index=True)
+                        if '时间' in channel_df.columns:
+                            channel_df = channel_df.drop_duplicates(subset=['时间'], keep='last')
+                            print(f"  - Channel {channel_code}: {len(channel_df)} rows after deduplication")
+                        all_channel_dfs.append(channel_df)
+                
+                if all_channel_dfs:
+                    influencer_ltv_combined = pd.concat(all_channel_dfs, ignore_index=True)
+                    
+                    if '时间' in influencer_ltv_combined.columns:
+                        # 排除时间列和LTV标签列
+                        ltv_label_cols = ['首日LTV', '2日LTV', '3日LTV', '7日LTV', '14日LTV', '30日LTV', '60日LTV']
+                        numeric_cols = []
+                        
+                        for col in influencer_ltv_combined.columns:
+                            if col != '时间' and col not in ltv_label_cols:
+                                try:
+                                    influencer_ltv_combined[col] = pd.to_numeric(
+                                        influencer_ltv_combined[col].astype(str).str.replace('$', '').str.replace('%', '').str.replace(',', ''), 
+                                        errors='coerce'
+                                    )
+                                    if influencer_ltv_combined[col].dtype in ['int64', 'float64']:
+                                        numeric_cols.append(col)
+                                except:
+                                    pass
+                        
+                        print(f"  - Found {len(numeric_cols)} numerical columns to sum")
+                        if len(numeric_cols) > 0:
+                            print(f"  - Sample numeric columns: {numeric_cols[:5]}")
+                        
+                        if numeric_cols:
+                            # 保存非数值列
+                            non_numeric_cols = [col for col in influencer_ltv_combined.columns if col not in numeric_cols and col != '时间']
+                            
+                            # Group by time and sum数值列
+                            influencer_ltv_summed = influencer_ltv_combined.groupby('时间', as_index=False)[numeric_cols].sum()
+                            
+                            # 合并非数值列
+                            if non_numeric_cols:
+                                non_numeric_data = influencer_ltv_combined.groupby('时间', as_index=False)[non_numeric_cols].first()
+                                influencer_ltv_combined = pd.merge(influencer_ltv_summed, non_numeric_data, on='时间', how='left')
+                            else:
+                                influencer_ltv_combined = influencer_ltv_summed
+                            
+                            print(f"  - After grouping: {len(influencer_ltv_combined)} rows, {len(influencer_ltv_combined.columns)} columns")
+                        else:
+                            influencer_ltv_combined = influencer_ltv_combined.drop_duplicates(subset=['时间'], keep='last')
+                            print(f"  - After deduplication: {len(influencer_ltv_combined)} rows")
+                        
+                        influencer_ltv_combined = influencer_ltv_combined.sort_values('时间')
+                    
+                    format_ltv_sheet_with_headers(writer, influencer_ltv_combined, '网红LTV')
+                    print("  - 'Influencer LTV' sheet written with formatted headers.")
+            except Exception as e:
+                print(f"  Error processing Influencer LTV files: {e}")
+                import traceback
+                traceback.print_exc()
         
+        # 13. 投放LTV - 按渠道分别去重后按日期合并
+        print("\nProcessing 'Ad LTV' sheet...")
         if ad_ltv_files:
-            print("\n正在处理 '投放LTV' sheet...")
-            format_ltv_sheet(writer, ad_ltv_files, '投放LTV', is_platform=False)
-            print("- '投放LTV' sheet 已写入并格式化。")
-        
-        # 生成VNL大盘日报
-        print("\n正在处理 'VNL大盘日报' sheet...")
-        daily_summary_data = generate_daily_summary_report(backend_files, channel_quality_files, user_quality_files, economic_files)
-        if daily_summary_data is not None and not daily_summary_data.empty:
-            format_daily_summary_sheet(writer, daily_summary_data, 'VNL大盘日报')
-            print("- 'VNL大盘日报' sheet 已写入并格式化。")
+            try:
+                # Only process files with current or previous month in filename
+                filtered_ad_files = [f for f in ad_ltv_files if '本月' in f or '上月' in f]
+                print(f"  - Filtered to {len(filtered_ad_files)} files (current and previous month only)")
+                
+                # Group by channel code
+                channel_data = {}
+                for file in filtered_ad_files:
+                    basename = os.path.basename(file)
+                    match = re.search(r'download_ltv_(\d+)', basename)
+                    if match:
+                        channel_code = match.group(1)
+                        if channel_code not in channel_data:
+                            channel_data[channel_code] = []
+                        
+                        print(f"    Processing Ad LTV file for channel {channel_code}")
+                    try:
+                        df = pd.read_csv(file, encoding='utf-8')
+                    except:
+                        try:
+                            df = pd.read_csv(file, encoding='gbk')
+                        except:
+                            df = pd.read_csv(file, encoding='latin-1')
+                        df.columns = df.columns.str.strip()
+                        channel_data[channel_code].append(df)
+                
+                # Deduplicate each channel separately, then combine
+                all_channel_dfs = []
+                for channel_code, dfs in channel_data.items():
+                    if dfs:
+                        channel_df = pd.concat(dfs, ignore_index=True)
+                        if '时间' in channel_df.columns:
+                            channel_df = channel_df.drop_duplicates(subset=['时间'], keep='last')
+                            print(f"  - Channel {channel_code}: {len(channel_df)} rows after deduplication")
+                        all_channel_dfs.append(channel_df)
+                
+                if all_channel_dfs:
+                    ad_ltv_combined = pd.concat(all_channel_dfs, ignore_index=True)
+                    
+                    if '时间' in ad_ltv_combined.columns:
+                        # 排除时间列和LTV标签列
+                        ltv_label_cols = ['首日LTV', '2日LTV', '3日LTV', '7日LTV', '14日LTV', '30日LTV', '60日LTV']
+                        numeric_cols = []
+                        
+                        for col in ad_ltv_combined.columns:
+                            if col != '时间' and col not in ltv_label_cols:
+                                try:
+                                    ad_ltv_combined[col] = pd.to_numeric(
+                                        ad_ltv_combined[col].astype(str).str.replace('$', '').str.replace('%', '').str.replace(',', ''), 
+                                        errors='coerce'
+                                    )
+                                    if ad_ltv_combined[col].dtype in ['int64', 'float64']:
+                                        numeric_cols.append(col)
+                                except:
+                                    pass
+                        
+                        print(f"  - Found {len(numeric_cols)} numerical columns to sum")
+                        if len(numeric_cols) > 0:
+                            print(f"  - Sample numeric columns: {numeric_cols[:5]}")
+                        
+                        if numeric_cols:
+                            # 保存非数值列
+                            non_numeric_cols = [col for col in ad_ltv_combined.columns if col not in numeric_cols and col != '时间']
+                            
+                            # Group by time and sum数值列
+                            ad_ltv_summed = ad_ltv_combined.groupby('时间', as_index=False)[numeric_cols].sum()
+                            
+                            # 合并非数值列
+                            if non_numeric_cols:
+                                non_numeric_data = ad_ltv_combined.groupby('时间', as_index=False)[non_numeric_cols].first()
+                                ad_ltv_combined = pd.merge(ad_ltv_summed, non_numeric_data, on='时间', how='left')
+                            else:
+                                ad_ltv_combined = ad_ltv_summed
+                            
+                            print(f"  - After grouping: {len(ad_ltv_combined)} rows, {len(ad_ltv_combined.columns)} columns")
+                        else:
+                            ad_ltv_combined = ad_ltv_combined.drop_duplicates(subset=['时间'], keep='last')
+                            print(f"  - After deduplication: {len(ad_ltv_combined)} rows")
+                        
+                        ad_ltv_combined = ad_ltv_combined.sort_values('时间')
+                    
+                    format_ltv_sheet_with_headers(writer, ad_ltv_combined, '投放LTV')
+                    print("  - 'Ad LTV' sheet written with formatted headers.")
+            except Exception as e:
+                print(f"  Error processing Ad LTV files: {e}")
+                import traceback
+                traceback.print_exc()
         
         if 'Sheet1' in writer.book.sheetnames:
             writer.book.remove(writer.book['Sheet1'])
