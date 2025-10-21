@@ -615,6 +615,10 @@ def format_platform_ltv_sheet(writer, df, sheet_name):
 
 def format_ltv_sheet_with_headers(writer, df, sheet_name):
     """格式化LTV sheet，创建两行表头结构，正确处理源文件的列名"""
+    print(f"  [DEBUG] format_ltv_sheet_with_headers called for '{sheet_name}'")
+    print(f"  [DEBUG] DataFrame shape: {df.shape}")
+    print(f"  [DEBUG] DataFrame columns ({len(df.columns)}): {list(df.columns)[:15]}...")
+    
     workbook = writer.book
     worksheet = workbook.create_sheet(title=sheet_name)
     
@@ -1405,7 +1409,7 @@ def main():
     # 渠道首充复登使用 用户留存率_首充复登 文件
     channel_login_files = find_files("用户留存率_首充复登_*_*.csv")
     if not channel_login_files:
-        channel_login_files = find_files("download_first_recharge_return_*_*.csv")
+    channel_login_files = find_files("download_first_recharge_return_*_*.csv")
     
     # 渠道首充复充使用 用户留存率_首充复充 文件
     channel_recharge_files = find_files("用户留存率_首充复充_*_*.csv")
