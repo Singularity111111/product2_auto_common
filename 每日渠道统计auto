@@ -54,8 +54,6 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-
-
 # 设置中文字体
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
@@ -718,6 +716,12 @@ class VNLReportGenerator:
             print(f"Debug: Data already in USD format - no conversion needed")
 
             return df_converted
+        
+        # 检查数据是否来自每日渠道统计（LTV文件）
+        # 如果有'方式'列，说明数据已经是美元，不需要转换
+        if '方式' in df.columns:
+            print(f"Debug: Data from LTV files (has '方式' column) - already in USD, no conversion needed")
+            return df_converted
 
         
 
@@ -1264,58 +1268,118 @@ class VNLReportGenerator:
 
     def _load_daily_channel_stats(self):
 
-        """加载每日渠道统计数据 - 从指定的CSV文件"""
+        """加载每日渠道统计数据 - 从LTV文件中按推广类型聚合"""
 
-        # 每日渠道统计的数据源文件
+        import glob
+        import re
 
-        files = [
+        # 推广类型映射规则：
+        # 111 = 投放, 222 = 网红, 333 = 短信
+        type_mapping = {
+            '111': '投放',
+            '222': '网红',
+            '333': '短信'
+        }
 
-            '每日渠道统计-渠道质量-10-17.csv',
-
-            '每日渠道统计-用户质量-10-17.csv',
-
-            '每日渠道统计-经济效益-10-17.csv'
-
-        ]
-
-        
+        # 读取所有LTV文件（本月数据）
+        ltv_files = glob.glob('download_ltv_*_本月_*.csv')
 
         data_list = []
 
-        for file in files:
+        for file in ltv_files:
 
             try:
 
-                if os.path.exists(file):
+                # 从文件名中提取总代号，例如: download_ltv_1102 _ TL_333_XXX_AAA_DP_本月_2025-10-22.csv
+                # 提取 TL_333_ 中的 333
+                match = re.search(r'TL_(\d{3})_', file)
+                if not match:
+                    continue
 
-                    try:
+                type_code = match.group(1)
 
-                        df = pd.read_csv(file, encoding='utf-8')
+                # 根据映射规则确定推广方式
+                if type_code not in type_mapping:
+                    continue  # 跳过未知类型
+
+                placement_type = type_mapping[type_code]
+
+                # 读取CSV文件
+                df = pd.read_csv(file, encoding='utf-8')
+
+                # 添加方式列
+                df['方式'] = placement_type
+
+                # 解析时间列，转换为datetime
+                if '时间' in df.columns:
+                    df['时间'] = pd.to_datetime(df['时间'], errors='coerce')
+
+                # 清理数值列中的美元符号、百分号和逗号
+                for col in df.columns:
+                    if col not in ['时间', '方式']:
+                        if df[col].dtype == 'object':
+                            # 移除美元符号、百分号、逗号
+                            df[col] = df[col].astype(str).str.replace('$', '', regex=False)
+                            df[col] = df[col].str.replace('%', '', regex=False)
+                            df[col] = df[col].str.replace(',', '', regex=False)
+                            # 尝试转换为数值
+                            df[col] = pd.to_numeric(df[col], errors='ignore')
 
                         data_list.append(df)
+                print(f"  加载{placement_type}数据: {file} ({len(df)}行)")
 
-                        print(f"  Loaded {file}: {df.shape}")
-                    except:
-
-                        df = pd.read_csv(file, encoding='gbk')
-
-                        data_list.append(df)
-
-                        print(f"  Loaded {file}: {df.shape}")
-                else:
-
-                    print(f"  Warning: {file} not found")
             except Exception as e:
 
-                print(f"  Error loading {file}: {e}")
-        
+                print(f"  加载{file}失败: {e}")
 
         if data_list:
 
             # 合并所有数据
+            all_data = pd.concat(data_list, ignore_index=True)
 
-            return pd.concat(data_list, ignore_index=True)
+            # 按日期和方式聚合数据
+            if '时间' in all_data.columns and '方式' in all_data.columns:
+                # 过滤掉无效日期
+                all_data = all_data[all_data['时间'].notna()].copy()
 
+                # 获取数值列（用于聚合）
+                numeric_cols = all_data.select_dtypes(include=['float64', 'int64']).columns.tolist()
+
+                # 构建聚合字典
+                agg_dict = {}
+                for col in numeric_cols:
+                    agg_dict[col] = 'sum'
+
+                # 按日期和方式分组聚合
+                if agg_dict:
+                    all_data = all_data.groupby(['时间', '方式'], as_index=False).agg(agg_dict)
+                    print(f"  按日期和方式聚合后: {all_data.shape}")
+                
+                # 列名映射：将LTV文件的列名映射到产品二文件的列名
+                column_mapping = {
+                    '消耗': '当日消耗($)',
+                    '新增用户单价': '注册成本',
+                    '首充人数': '首充付费人数',
+                    # 保持这些列名不变
+                    '新增用户': '新增用户',
+                    '首充成本': '首充成本',
+                    '时间': '时间',
+                    '方式': '方式'
+                }
+                
+                # 重命名列
+                rename_dict = {}
+                for old_col, new_col in column_mapping.items():
+                    if old_col in all_data.columns:
+                        rename_dict[old_col] = new_col
+                
+                if rename_dict:
+                    all_data = all_data.rename(columns=rename_dict)
+                    print(f"  重命名列: {list(rename_dict.keys())} -> {list(rename_dict.values())}")
+
+            return all_data
+
+        print(f"  Warning: 未找到LTV文件")
         return pd.DataFrame()
 
     
@@ -1412,76 +1476,74 @@ class VNLReportGenerator:
 
     
 
-    def _calculate_ltv_for_period(self, ltv_data, target_date, days_back):
+    def _calculate_ltv_for_period(self, ltv_data, backend_data, target_date, days_back):
 
-        """计算指定天数前的LTV值"""
+        """从LTV数据中获取指定天数的LTV值
+        
+        参数:
+            ltv_data: LTV数据（包含14日LTV、30日LTV等预计算的LTV值）
+            backend_data: 后台数据（暂未使用，为了兼容性保留）
+            target_date: 目标日期（当前报表日期）
+            days_back: 天数（14或30）
+        """
 
         try:
 
-            # 计算目标日期（days_back天前）
-
-            from datetime import timedelta
-
-            period_date = target_date - timedelta(days=days_back)
-
-            
-
-            # 在LTV数据中查找对应日期的数据
-
-            if '时间' in ltv_data.columns:
-
                 # 确保时间列是datetime类型
-
+            if '时间' in ltv_data.columns:
                 if ltv_data['时间'].dtype == 'object':
-
-                    ltv_data['时间'] = pd.to_datetime(ltv_data['时间'], errors='coerce')
-
-                
-
-                # 查找对应日期的数据
-                # 处理period_date可能是date或datetime类型
-                period_date_only = period_date.date() if hasattr(period_date, 'date') else period_date
-                period_data = ltv_data[ltv_data['时间'].dt.date == period_date_only]
+                    ltv_data['时间'] = pd.to_datetime(ltv_data['时间'], dayfirst=True, errors='coerce')
 
                 
 
-                if not period_data.empty:
+                # 查找目标日期的LTV数据
+                target_date_only = target_date.date() if hasattr(target_date, 'date') else target_date
+                date_data = ltv_data[ltv_data['时间'].dt.date == target_date_only]
+                
+                if date_data.empty:
+                    print(f"Debug: {days_back}日LTV - 未找到目标日期({target_date_only})的LTV数据")
+                    return 0
 
-                    # 计算LTV
+                
 
-                    recharge_amount = pd.to_numeric(period_data.iloc[0].get('充值金额', 0), errors='coerce')
-
-                    withdraw_amount = pd.to_numeric(period_data.iloc[0].get('提现金额', 0), errors='coerce')
-
-                    recharge_users = pd.to_numeric(period_data.iloc[0].get('充值人数', 0), errors='coerce')
-
-                    
-
-                    if pd.notna(recharge_amount) and pd.notna(withdraw_amount) and pd.notna(recharge_users) and recharge_users > 0:
-
-                        ltv_value = (recharge_amount - withdraw_amount) / recharge_users
-
-                        print(f"Debug: {days_back}日LTV计算 - 日期: {period_date_only}, 充提差: {recharge_amount - withdraw_amount}, 充值人数: {recharge_users}, LTV: {ltv_value}")
+                # 根据days_back获取对应的LTV列
+                ltv_col_name = f'{days_back}日LTV'
+                
+                if ltv_col_name not in date_data.columns:
+                    print(f"Debug: {days_back}日LTV - LTV数据中没有'{ltv_col_name}'列")
+                    return 0
+                
+                # 获取LTV值（可能是字符串格式如"4.6$"）
+                ltv_value_raw = date_data.iloc[0][ltv_col_name]
+                
+                if pd.isna(ltv_value_raw) or ltv_value_raw == '' or ltv_value_raw == 0:
+                    print(f"Debug: {days_back}日LTV - 值为空或0")
+                    return 0
+                
+                # 处理美元符号和格式
+                if isinstance(ltv_value_raw, str):
+                    ltv_value_str = ltv_value_raw.replace('$', '').replace(',', '').strip()
+                    ltv_value = pd.to_numeric(ltv_value_str, errors='coerce')
+                else:
+                    ltv_value = pd.to_numeric(ltv_value_raw, errors='coerce')
+                
+                if pd.isna(ltv_value):
+                    ltv_value = 0
+                
+                print(f"Debug: {days_back}日LTV - 日期:{target_date_only}, 原始值:{ltv_value_raw}, LTV:{ltv_value}")
+                
                         return ltv_value
 
                     else:
 
-                        print(f"Debug: {days_back}日LTV计算 - 数据无效，日期: {period_date_only}")
-                        return 0
-
-                else:
-
-                    print(f"Debug: {days_back}日LTV计算 - 未找到对应日期数据: {period_date_only}")
-                    return 0
-
-            else:
-
-                print(f"Debug: {days_back}日LTV计算 - LTV数据中没有时间列")
+                print(f"Debug: {days_back}日LTV - LTV数据中没有时间列")
                 return 0
 
         except Exception as e:
 
             print(f"Debug: {days_back}日LTV计算失败: {e}")
+            import traceback
+            traceback.print_exc()
             return 0
 
 
@@ -1870,9 +1932,9 @@ class VNLReportGenerator:
 
                 '首充次日复充率': retention_rates.get('首充次日复充率', 0),
 
-                '首充3日 复充率': retention_rates.get('首充3日 复充率', 0),
-                '首充7日 复充率': retention_rates.get('首充7日 复充率', 0),
-                '首充30日 复充率': retention_rates.get('首充30日 复充率', 0),
+                '首充3日 复充率': retention_rates.get('首充3日复充率', 0),
+                '首充7日 复充率': retention_rates.get('首充7日复充率', 0),
+                '首充30日 复充率': retention_rates.get('首充30日复充率', 0),
                 '首充次日复登率': retention_rates.get('首充次日复登率', 0),
 
                 '首充3日复登率': retention_rates.get('首充3日复登率', 0),
@@ -2164,8 +2226,9 @@ class VNLReportGenerator:
                 try:
 
                     # 方式1：处理数据源中的日期格式（2025-01-09, 2025-02-09等）
+                    # 注意：使用dayfirst=True以支持D/M/YYYY格式（如13/10/2025）
 
-                    login_df['时间'] = pd.to_datetime(login_df['时间'], errors='coerce')
+                    login_df['时间'] = pd.to_datetime(login_df['时间'], dayfirst=True, errors='coerce')
                     target_date = pd.to_datetime(date_str)
                     
 
@@ -2201,6 +2264,10 @@ class VNLReportGenerator:
 
                         if len(date_data) == 0:
 
+                            # 只在日期<=12时才尝试交换（避免13号以后尝试匹配"13月"）
+
+                            if target_day <= 12:
+
                             date_data = login_df[
 
                                 (login_df['时间'].dt.month == target_day) & 
@@ -2211,19 +2278,36 @@ class VNLReportGenerator:
 
                             print(f"Debug: Login swapped month-day match found {len(date_data)} rows")
 
+                            else:
+
+                                # 日期>12时，只尝试正常匹配（不交换）
+
+                                print(f"Debug: Login day>12, skipping swap, trying direct match again")
+
                     
 
                     # 如果还是没找到，尝试字符串匹配
 
                     if len(date_data) == 0:
 
-                        # 尝试匹配日期字符串
-
-                        date_str_formatted = target_date.strftime('%Y-%m-%d')
-
-                        date_data = login_df[login_df['时间'].astype(str).str.contains(date_str_formatted, na=False)]
-
-                        print(f"Debug: Login string match found {len(date_data)} rows")
+                        # 尝试多种日期格式
+                        date_formats = [
+                            target_date.strftime('%Y-%m-%d'),  # 2025-10-09
+                            f"{target_date.day}/{target_date.month}/{target_date.year}",  # 9/10/2025 or 13/10/2025
+                            f"{target_date.day:02d}/{target_date.month:02d}/{target_date.year}",  # 09/10/2025 or 13/10/2025
+                            f"{target_date.month}/{target_date.day}/{target_date.year}",  # 10/9/2025 or 10/13/2025
+                        ]
+                        
+                        for date_format in date_formats:
+                            date_data = login_df[login_df['时间'].astype(str).str.contains(date_format, na=False, regex=False)]
+                            if not date_data.empty:
+                                print(f"Debug: Login string match found {len(date_data)} rows with format {date_format}")
+                                break
+                            else:
+                                print(f"Debug: Login trying format {date_format}, found 0 rows")
+                        
+                        if date_data.empty:
+                            print(f"Debug: Login string match found 0 rows after trying all formats")
 
                 except Exception as e:
 
@@ -2233,7 +2317,7 @@ class VNLReportGenerator:
 
                         # 方式2：尝试其他日期格式
 
-                        login_df['时间'] = pd.to_datetime(login_df['时间'], errors='coerce')
+                        login_df['时间'] = pd.to_datetime(login_df['时间'], dayfirst=True, errors='coerce')
                         target_date = pd.to_datetime(date_str)
                         date_data = login_df[login_df['时间'].dt.date == target_date.date()]
 
@@ -2361,7 +2445,8 @@ class VNLReportGenerator:
                 try:
 
                     # 方式1：处理数据源中的日期格式（2025-01-09, 2025-02-09等）
-                    recharge_df[time_col] = pd.to_datetime(recharge_df[time_col], errors='coerce')
+                    # 注意：使用dayfirst=True以支持D/M/YYYY格式（如13/10/2025）
+                    recharge_df[time_col] = pd.to_datetime(recharge_df[time_col], dayfirst=True, errors='coerce')
                     target_date = pd.to_datetime(date_str)
                     
                     # 尝试匹配年月日
@@ -2392,6 +2477,10 @@ class VNLReportGenerator:
                         # 如果还是没找到，尝试交换月份和日期（处理MM/DD vs DD/MM格式）
                         if len(date_data) == 0:
 
+                            # 只在日期<=12时才尝试交换（避免13号以后尝试匹配"13月"）
+
+                            if target_day <= 12:
+
                             date_data = recharge_df[
 
                                 (recharge_df[time_col].dt.month == target_day) & 
@@ -2401,19 +2490,36 @@ class VNLReportGenerator:
                             ]
 
                             print(f"Debug: Recharge swapped month-day match found {len(date_data)} rows")
+
+                            else:
+
+                                # 日期>12时，只尝试正常匹配（不交换）
+
+                                print(f"Debug: Recharge day>12, skipping swap, trying direct match again")
                     
 
                     # 如果还是没找到，尝试字符串匹配
 
                     if len(date_data) == 0:
 
-                        # 尝试匹配日期字符串
-
-                        date_str_formatted = target_date.strftime('%Y-%m-%d')
-
-                        date_data = recharge_df[recharge_df[time_col].astype(str).str.contains(date_str_formatted, na=False)]
-
-                        print(f"Debug: Recharge string match found {len(date_data)} rows")
+                        # 尝试多种日期格式
+                        date_formats = [
+                            target_date.strftime('%Y-%m-%d'),  # 2025-10-09
+                            f"{target_date.day}/{target_date.month}/{target_date.year}",  # 9/10/2025 or 13/10/2025
+                            f"{target_date.day:02d}/{target_date.month:02d}/{target_date.year}",  # 09/10/2025 or 13/10/2025
+                            f"{target_date.month}/{target_date.day}/{target_date.year}",  # 10/9/2025 or 10/13/2025
+                        ]
+                        
+                        for date_format in date_formats:
+                            date_data = recharge_df[recharge_df[time_col].astype(str).str.contains(date_format, na=False, regex=False)]
+                            if not date_data.empty:
+                                print(f"Debug: Recharge string match found {len(date_data)} rows with format {date_format}")
+                                break
+                            else:
+                                print(f"Debug: Recharge trying format {date_format}, found 0 rows")
+                        
+                        if date_data.empty:
+                            print(f"Debug: Recharge string match found 0 rows after trying all formats")
 
                 except Exception as e:
 
@@ -2423,7 +2529,7 @@ class VNLReportGenerator:
 
                         # 方式2：尝试其他日期格式
 
-                        recharge_df[time_col] = pd.to_datetime(recharge_df[time_col], errors='coerce')
+                        recharge_df[time_col] = pd.to_datetime(recharge_df[time_col], dayfirst=True, errors='coerce')
                         target_date = pd.to_datetime(date_str)
                         date_data = recharge_df[recharge_df[time_col].dt.date == target_date.date()]
 
@@ -3365,16 +3471,16 @@ class VNLReportGenerator:
 
         elif 'VNL短信日报' in title:
 
-            # 使用产品二文件的完整字段作为模板
-            matched_sheet = '短信'
+            # 使用产品二文件的完整字段作为模板，或使用LTV数据
+            matched_sheet = '短信' if '短信' in df_dict else '短信LTV'
         elif 'VNL网红日报' in title:
 
-            # 使用产品二文件的完整字段作为模板
-            matched_sheet = '网红'
+            # 使用产品二文件的完整字段作为模板，或使用LTV数据
+            matched_sheet = '网红' if '网红' in df_dict else '网红LTV'
         elif 'VNL投放日报' in title:
 
-            # 使用产品二文件的完整字段作为模板
-            matched_sheet = '投放'
+            # 使用产品二文件的完整字段作为模板，或使用LTV数据
+            matched_sheet = '投放' if '投放' in df_dict else '投放LTV'
         elif 'VNL投放明细' in title:
 
             matched_sheet = '后台'  # 使用后台数据，有37列，足够支持31个字段
@@ -3431,9 +3537,9 @@ class VNLReportGenerator:
                 print(f"  检测到日报类型: {title}")
                 
                 # 检查是否来自产品二文件（完整字段）还是LTV文件（需要聚合）
-                if matched_sheet in ['短信', '网红', '投放']:
-                    # 来自产品二文件，数据已经在load_data中被清理过了
-                    print(f"  使用产品二文件的完整字段数据")
+                if matched_sheet in ['短信', '网红', '投放', '短信LTV', '网红LTV', '投放LTV']:
+                    # 来自产品二文件或LTV文件，数据已经在load_data中被清理过了
+                    print(f"  使用{matched_sheet}数据")
                     
                     # 找到日期列并统一为'时间'
                     date_col = None
@@ -7427,10 +7533,10 @@ class VNLReportGenerator:
                     print(f"Debug: 充值人数为0，LTV设为0")
                 
                 # 尝试获取14日和30日的LTV数据
-                # 14日LTV：从14天前的数据计算
-                ltv_14 = self._calculate_ltv_for_period(ltv_data, backend_date, 14)
-                # 30日LTV：从30天前的数据计算  
-                ltv_30 = self._calculate_ltv_for_period(ltv_data, backend_date, 30)
+                # 14日LTV：基准日期(14天前)的首充用户在14天内的累计充提差
+                ltv_14 = self._calculate_ltv_for_period(ltv_data, backend_data, backend_date, 14)
+                # 30日LTV：基准日期(30天前)的首充用户在30天内的累计充提差
+                ltv_30 = self._calculate_ltv_for_period(ltv_data, backend_data, backend_date, 30)
                 
                 # 如果没有找到对应日期的数据，使用当前日期的LTV
                 if ltv_14 == 0:
@@ -7634,11 +7740,21 @@ class VNLReportGenerator:
                 if betting_rate_key in row:
 
                     # 如果后台sheet直接有复投率数据
-
-                    betting_rate = pd.to_numeric(row.get(betting_rate_key, 0), errors='coerce')
+                    betting_rate_value = row.get(betting_rate_key, 0)
+                    
+                    # 处理百分比格式
+                    if isinstance(betting_rate_value, str) and '%' in betting_rate_value:
+                        try:
+                            betting_rate = float(betting_rate_value.replace('%', '').strip()) / 100
+                            print(f"Debug: 从后台读取{day}复投率(百分比) = {betting_rate_value} -> {betting_rate}")
+                        except:
+                            betting_rate = 0
+                    else:
+                        betting_rate = pd.to_numeric(betting_rate_value, errors='coerce')
                     if pd.isna(betting_rate):
-
                         betting_rate = 0
+                        else:
+                            print(f"Debug: 从后台读取{day}复投率(数值) = {betting_rate_value} -> {betting_rate}")
 
                     first_recharge_betting_rates[f'首充{day}复投率'] = betting_rate
                 else:
@@ -7707,9 +7823,9 @@ class VNLReportGenerator:
 
                 '首充次日复充率': retention_rates.get('首充次日复充率', 0),
 
-                '首充3日 复充率': retention_rates.get('首充3日 复充率', 0),
-                '首充7日 复充率': retention_rates.get('首充7日 复充率', 0),
-                '首充30日 复充率': retention_rates.get('首充30日 复充率', 0),
+                '首充3日复充率': retention_rates.get('首充3日复充率', 0),
+                '首充7日复充率': retention_rates.get('首充7日复充率', 0),
+                '首充30日复充率': retention_rates.get('首充30日复充率', 0),
                 '非一级首充人数/首充人数': (first_recharge_users - first_level_users) / first_recharge_users if first_recharge_users > 0 else 0,
                 '非一级首充人数/充值人数': (first_recharge_users - first_level_users) / recharge_users if recharge_users > 0 else 0,
                 '首充数转化率': first_recharge_rate,
