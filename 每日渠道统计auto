@@ -54,11 +54,40 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+# 导入渠道配置
+# from channel_config import (
+#     CHANNEL_RULES,
+#     get_channel_by_code,
+#     get_code_to_category_map,
+#     parse_channel_name
+# )
+
 # 设置中文字体
 
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei']
 
 plt.rcParams['axes.unicode_minus'] = False
+
+# 全局日期年份修复函数
+def fix_date_year(df, date_col='时间'):
+    """修复日期年份：将2025年的7-11月数据改为2024年
+    
+    Args:
+        df: DataFrame
+        date_col: 日期列名，默认'时间'
+    
+    Returns:
+        修复后的DataFrame
+    """
+    if date_col in df.columns:
+        def fix_year(date_val):
+            if pd.notna(date_val) and hasattr(date_val, 'year'):
+                if date_val.year == 2025 and 7 <= date_val.month <= 11:
+                    return date_val.replace(year=2024)
+            return date_val
+        
+        df[date_col] = df[date_col].apply(fix_year)
+    return df
 
 
 
@@ -967,11 +996,68 @@ class VNLReportGenerator:
                             # 将日期列转换为仅显示日期（不显示时间）
                             if '日期' in df_data.columns:
                                 df_data['日期'] = pd.to_datetime(df_data['日期'], errors='coerce')
+                                
+                                # 修复年份
+                                df_data = fix_date_year(df_data, '日期')
+                                
                                 # 只保留日期部分
                                 df_data['日期'] = df_data['日期'].dt.date
                             
-                            df_dict[sheet_name] = df_data
-                            print(f"  Added {sheet_name} from 产品二: {df_data.shape} (cleaned)")
+                            # 按日期范围合并数据：final_report_v4 的数据优先（最新），产品二补充缺失的历史数据
+                            if sheet_name in df_dict:
+                                df_final_report = df_dict[sheet_name]
+                                df_product2 = df_data
+                                
+                                try:
+                                    # 确保都有日期列
+                                    if '日期' in df_final_report.columns and '日期' in df_product2.columns:
+                                        # 转换日期格式以便比较
+                                        df_final_report['日期'] = pd.to_datetime(df_final_report['日期'], errors='coerce')
+                                        df_product2['日期'] = pd.to_datetime(df_product2['日期'], errors='coerce')
+                                        
+                                        # 获取两个数据源的日期范围
+                                        final_min = df_final_report['日期'].min()
+                                        final_max = df_final_report['日期'].max()
+                                        product2_min = df_product2['日期'].min()
+                                        product2_max = df_product2['日期'].max()
+                                        
+                                        print(f"    {sheet_name} 日期范围:")
+                                        print(f"      产品二: {product2_min} ~ {product2_max}")
+                                        print(f"      final_report_v4: {final_min} ~ {final_max}")
+                                        
+                                        # 策略：final_report_v4 的数据优先（最新），产品二补充缺失的历史数据
+                                        # 1. 先取 final_report_v4 的所有数据
+                                        df_merged = df_final_report.copy()
+                                        
+                                        # 2. 从产品二中取出 final_report_v4 没有的日期
+                                        final_dates = set(df_final_report['日期'].dropna())
+                                        df_product2_supplement = df_product2[~df_product2['日期'].isin(final_dates)].copy()
+                                        
+                                        # 3. 合并
+                                        if len(df_product2_supplement) > 0:
+                                            df_merged = pd.concat([df_merged, df_product2_supplement], ignore_index=True)
+                                            df_merged = df_merged.sort_values('日期').reset_index(drop=True)
+                                            print(f"      合并结果: final_report_v4({len(df_final_report)}条) + 产品二补充({len(df_product2_supplement)}条) = {len(df_merged)}条")
+                                        else:
+                                            print(f"      final_report_v4 已包含所有日期，无需补充")
+                                        
+                                        # 转回日期格式（不含时间）
+                                        df_merged['日期'] = df_merged['日期'].dt.date
+                                        df_dict[sheet_name] = df_merged
+                                        
+                                    else:
+                                        # 如果没有日期列，直接使用 final_report_v4
+                                        print(f"    Warning: {sheet_name} 缺少日期列，使用 final_report_v4 数据")
+                                        df_dict[sheet_name] = df_final_report
+                                        
+                                except Exception as e:
+                                    print(f"    Warning: 合并 {sheet_name} 失败: {e}")
+                                    print(f"    使用 final_report_v4 数据")
+                                    df_dict[sheet_name] = df_final_report
+                            else:
+                                # 如果 final_report_v4 中没有这个 sheet，直接使用产品二的数据
+                                df_dict[sheet_name] = df_data
+                                print(f"  Added {sheet_name} from 产品二 only: {df_data.shape}")
             except Exception as e:
                 print(f"  Warning: Could not load 产品二 file: {e}")
 
@@ -1313,6 +1399,8 @@ class VNLReportGenerator:
                 # 解析时间列，转换为datetime
                 if '时间' in df.columns:
                     df['时间'] = pd.to_datetime(df['时间'], errors='coerce')
+                    # 修复年份
+                    df = fix_date_year(df, '时间')
 
                 # 清理数值列中的美元符号、百分号和逗号
                 for col in df.columns:
@@ -1325,7 +1413,7 @@ class VNLReportGenerator:
                             # 尝试转换为数值
                             df[col] = pd.to_numeric(df[col], errors='ignore')
 
-                        data_list.append(df)
+                data_list.append(df)
                 print(f"  加载{placement_type}数据: {file} ({len(df)}行)")
 
             except Exception as e:
@@ -1489,7 +1577,7 @@ class VNLReportGenerator:
 
         try:
 
-                # 确保时间列是datetime类型
+            # 确保时间列是datetime类型
             if '时间' in ltv_data.columns:
                 if ltv_data['时间'].dtype == 'object':
                     ltv_data['时间'] = pd.to_datetime(ltv_data['时间'], dayfirst=True, errors='coerce')
@@ -1532,9 +1620,9 @@ class VNLReportGenerator:
                 
                 print(f"Debug: {days_back}日LTV - 日期:{target_date_only}, 原始值:{ltv_value_raw}, LTV:{ltv_value}")
                 
-                        return ltv_value
+                return ltv_value
 
-                    else:
+            else:
 
                 print(f"Debug: {days_back}日LTV - LTV数据中没有时间列")
                 return 0
@@ -2268,15 +2356,15 @@ class VNLReportGenerator:
 
                             if target_day <= 12:
 
-                            date_data = login_df[
+                                date_data = login_df[
 
-                                (login_df['时间'].dt.month == target_day) & 
+                                    (login_df['时间'].dt.month == target_day) & 
 
-                                (login_df['时间'].dt.day == target_month)
+                                    (login_df['时间'].dt.day == target_month)
 
-                            ]
+                                ]
 
-                            print(f"Debug: Login swapped month-day match found {len(date_data)} rows")
+                                print(f"Debug: Login swapped month-day match found {len(date_data)} rows")
 
                             else:
 
@@ -2481,15 +2569,15 @@ class VNLReportGenerator:
 
                             if target_day <= 12:
 
-                            date_data = recharge_df[
+                                date_data = recharge_df[
 
-                                (recharge_df[time_col].dt.month == target_day) & 
+                                    (recharge_df[time_col].dt.month == target_day) & 
 
-                                (recharge_df[time_col].dt.day == target_month)
+                                    (recharge_df[time_col].dt.day == target_month)
 
-                            ]
+                                ]
 
-                            print(f"Debug: Recharge swapped month-day match found {len(date_data)} rows")
+                                print(f"Debug: Recharge swapped month-day match found {len(date_data)} rows")
 
                             else:
 
@@ -3554,6 +3642,8 @@ class VNLReportGenerator:
                     # 转换日期并过滤有效数据
                     if '时间' in df.columns:
                         df['时间'] = pd.to_datetime(df['时间'], errors='coerce')
+                        # 修复年份
+                        df = fix_date_year(df, '时间')
                         df = df[df['时间'].notna()].copy()
                         print(f"  处理后数据: {len(df)}行, {len(df.columns)}列")
                         
@@ -3562,7 +3652,7 @@ class VNLReportGenerator:
                         print(f"  产品二数据最后日期: {max_date}")
                         
                         if pd.notna(max_date):
-                            target_dates = [pd.Timestamp(2025, 10, 19), pd.Timestamp(2025, 10, 20)]
+                            target_dates = [pd.Timestamp(2024, 10, 19), pd.Timestamp(2024, 10, 20)]
                             
                             # 检查这些日期的数据是否为空（所有数值列都是0或NaN）
                             empty_dates = []
@@ -3732,6 +3822,8 @@ class VNLReportGenerator:
                     print(f"  使用LTV数据，需要按日期聚合")
                     # 转换日期
                     df['时间'] = pd.to_datetime(df['时间'], errors='coerce')
+                    # 修复年份
+                    df = fix_date_year(df, '时间')
                     
                     # 跳过第一行（可能是标题）
                     if len(df) > 0 and pd.isna(df.iloc[0]['时间']):
@@ -4600,13 +4692,16 @@ class VNLReportGenerator:
 
         """设置简报页数字格式 - 统一格式，避免长小数"""
 
-        for row in range(4, ws.max_row + 1):
+        # 确定表头行（第4行是表头）
+        header_row = 4
+        
+        for row in range(header_row + 1, ws.max_row + 1):
 
             for col in range(1, ws.max_column + 1):
 
                 cell = ws.cell(row=row, column=col)
 
-                header_cell = ws.cell(row=1, column=col)
+                header_cell = ws.cell(row=header_row, column=col)
 
                 header_text = str(header_cell.value or '').lower()
 
@@ -4618,7 +4713,7 @@ class VNLReportGenerator:
 
                     cell.number_format = '#,##0.00'  # 货币：千分位+2位小数
 
-                elif '率' in header_text or '比' in header_text or 'ROI' in header_text:
+                elif '率' in header_text or '比' in header_text or 'ROI' in header_text or '非一级首充' in header_text:
 
                     cell.number_format = '0.0%'  # 百分比：1位小数
 
@@ -5953,7 +6048,7 @@ class VNLReportGenerator:
 
                     cell.number_format = '#,##0.00'  # 货币：千分位+2位小数
 
-                elif '率' in col_name or '比' in col_name or 'ROI' in col_name:
+                elif '率' in col_name or '比' in col_name or 'ROI' in col_name or '非一级首充' in col_name:
 
                     cell.number_format = '0.0%'  # 百分比：1位小数
 
@@ -6037,7 +6132,7 @@ class VNLReportGenerator:
 
                             cell.number_format = '0.00'  # 小数值2位小数
 
-                    elif '率' in col_name or '比' in col_name or 'ROI' in col_name:
+                    elif '率' in col_name or '比' in col_name or 'ROI' in col_name or '非一级首充' in col_name:
 
                         # 确保百分比格式正确
 
@@ -6207,7 +6302,7 @@ class VNLReportGenerator:
 
                     cell.alignment = Alignment(horizontal='right', vertical='center')
 
-                elif '率' in col_name or '比' in col_name or 'ROI' in col_name:
+                elif '率' in col_name or '比' in col_name or 'ROI' in col_name or '非一级首充' in col_name:
 
                     cell.alignment = Alignment(horizontal='center', vertical='center')
 
@@ -6435,7 +6530,7 @@ class VNLReportGenerator:
 
                     cell.value = value
 
-                    if '%' in str(col_name) or '率' in str(col_name) or '比' in str(col_name):
+                    if '%' in str(col_name) or '率' in str(col_name) or '比' in str(col_name) or '非一级首充' in str(col_name):
 
                         # 比率列：1位小数百分比
 
@@ -7352,6 +7447,9 @@ class VNLReportGenerator:
             # 使用dayfirst=True来正确解析日期格式 (1/9/2025 = 2025年9月1日)
 
             backend_data['时间'] = pd.to_datetime(backend_data['时间'], dayfirst=True, errors='coerce')
+            
+            # 修复年份
+            backend_data = fix_date_year(backend_data, '时间')
 
             backend_data = backend_data.dropna(subset=['时间'])
 
@@ -7366,6 +7464,9 @@ class VNLReportGenerator:
             # LTV数据已经是ISO格式(2025-09-01)，直接解析即可
 
             ltv_data['时间'] = pd.to_datetime(ltv_data['时间'], errors='coerce')
+            
+            # 修复年份
+            ltv_data = fix_date_year(ltv_data, '时间')
 
             ltv_data = ltv_data.dropna(subset=['时间'])
 
@@ -7400,6 +7501,9 @@ class VNLReportGenerator:
         
 
         daily_data_list = []
+        
+        # 初始化累计消耗
+        cumulative_consumption = 0
 
         
 
@@ -7594,12 +7698,9 @@ class VNLReportGenerator:
             
 
             # 计算历史消耗（累计消耗）
-
-            # 从后台数据获取历史消耗，如果没有则使用当日消耗
-            historical_consumption = pd.to_numeric(row.get('历史消耗', 0), errors='coerce')
-            if pd.isna(historical_consumption):
-                historical_consumption = total_consumption  # 如果没有历史消耗数据，使用当日消耗
-            print(f"Debug: 历史消耗: {historical_consumption}")
+            # 累加当日消耗到历史消耗
+            cumulative_consumption += total_consumption
+            print(f"Debug: 当日消耗: {total_consumption}, 累计历史消耗: {cumulative_consumption}")
             
 
             # 后台sheet数据需要汇率换算
@@ -7751,8 +7852,8 @@ class VNLReportGenerator:
                             betting_rate = 0
                     else:
                         betting_rate = pd.to_numeric(betting_rate_value, errors='coerce')
-                    if pd.isna(betting_rate):
-                        betting_rate = 0
+                        if pd.isna(betting_rate):
+                            betting_rate = 0
                         else:
                             print(f"Debug: 从后台读取{day}复投率(数值) = {betting_rate_value} -> {betting_rate}")
 
@@ -7838,8 +7939,6 @@ class VNLReportGenerator:
 
                 '充值人数': recharge_users,
 
-                '日期': date_str,  # 重复的日期字段
-
                 '投注用户数': row.get('投注人数', 0),
 
                 '充投用户数': row.get('充值投注人数', 0),
@@ -7865,11 +7964,11 @@ class VNLReportGenerator:
 
                 '彩金赠送充值比': (row.get('总赠送', 0) / self.EXCHANGE_RATE) / recharge_amount if recharge_amount > 0 else 0,
 
-                '历史营收(历史充提差-历史消耗)': (row.get('充提差', 0) / self.EXCHANGE_RATE) - historical_consumption,
+                '历史营收(历史充提差-历史消耗)': (row.get('充提差', 0) / self.EXCHANGE_RATE) - cumulative_consumption,
 
                 '历史充提差': row.get('充提差', 0) / self.EXCHANGE_RATE,
 
-                '历史消耗': historical_consumption
+                '历史消耗': cumulative_consumption
 
             }
 
@@ -7882,6 +7981,29 @@ class VNLReportGenerator:
         if daily_data_list:
 
             df = pd.DataFrame(daily_data_list)
+            
+            # 定义大盘日报需要保留的列（按顺序）
+            required_columns = [
+                '日期', '总消耗(U)', '首充成本(U)', '一级首充成本(U)', '充提差比', '总充提差(U)',
+                '充值金额(U)', '首充充值金额(U)', '老用户充值金额(U)', '人均充值金额(U)',
+                '人均充值笔数', '首充人均充值金额(U)', '老用户人均充值金额U', '老用户付费率',
+                '14日LTV', '30日LTV', 
+                '首充次日复充率', '首充3日复充率', '首充7日复充率', '首充30日复充率',
+                '非一级首充人数/首充人数', '非一级首充人数/充值人数', '首充数转化率',
+                '新增注册人数', '首充人数', '一级首充人数', '充值人数',
+                '投注用户数', '充投用户数',
+                '首充次日复登率', '首充3日复登率', '首充7日复登率',
+                '首充次日复投率', '首充3日复投率', '首充7日复投率',
+                '投注金额(U)', '出入人数比', '游戏盈亏投注比', '投充比', '佣金金额(U)', '彩金赠送充值比',
+                '历史营收(历史充提差-历史消耗)', '历史充提差', '历史消耗'
+            ]
+            
+            # 只保留需要的列（如果列存在的话）
+            existing_columns = [col for col in required_columns if col in df.columns]
+            df = df[existing_columns]
+            
+            print(f"Debug: 大盘日报保留列数: {len(existing_columns)}")
+            print(f"Debug: 大盘日报列名: {existing_columns[:10]}...")  # 只打印前10个列名
 
             total_data, avg_data = self._calculate_summary_metrics(df)
 
@@ -7904,4 +8026,3 @@ def main():
 if __name__ == "__main__":
 
     main()
-
