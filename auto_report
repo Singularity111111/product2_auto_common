@@ -506,6 +506,178 @@ async def _clear_current_selection(scope, select_idx: int) -> bool:
         print(f"[CLEAR] 清除选择时出错: {e}，继续...")
         return False
 
+async def discover_all_platforms(scope, select_idx: int, skip_indices: list = None, skip_pattern: str = None) -> list[str]:
+    """
+    智能自动发现下拉列表中的所有平台选项
+    
+    Args:
+        scope: 页面或frame
+        select_idx: 平台下拉框的索引
+        skip_indices: 要跳过的平台索引列表（例如 [0, 2] 表示跳过索引0和2的选项）
+        skip_pattern: 要跳过的平台名称正则表达式（例如 "^全平台$|测试|已停用"）
+    
+    Returns:
+        平台名称列表（已去重并过滤）
+    """
+    pg = page_of(scope)
+    skip_indices = skip_indices or []
+    
+    print(f"[DISCOVER] 🔍 开始智能发现平台列表...")
+    print(f"[DISCOVER] 配置：跳过索引 {skip_indices}, 跳过模式 '{skip_pattern}'")
+    
+    # 1. 打开平台下拉框
+    opened = await _open_platform_dropdown(scope, select_idx)
+    if not opened:
+        print(f"[WARN] 无法打开平台下拉框，尝试备用方法...")
+        # 备用方法：直接点击
+        try:
+            container_selectors = [
+                ".el-select",
+                ".ant-select",
+                ".vxe-select--wrapper",
+                "[role='combobox']",
+            ]
+            for css in container_selectors:
+                loc = scope.locator(css)
+                if await loc.count() > select_idx:
+                    await loc.nth(select_idx).click()
+                    await asyncio.sleep(0.3)
+                    opened = True
+                    break
+        except Exception:
+            pass
+    
+    if not opened:
+        print(f"[ERROR] 无法打开平台下拉框，自动发现失败")
+        return []
+    
+    # 等待下拉选项渲染
+    await asyncio.sleep(0.6)
+    
+    # 2. 读取所有选项
+    panel_selectors = [
+        ".el-select-dropdown:visible",
+        ".ant-select-dropdown:not(.ant-select-dropdown-hidden)",
+        ".vxe-select--panel:visible",
+        "[role='listbox']:visible",
+    ]
+    
+    option_selectors = [
+        "[role='option']",
+        ".el-select-dropdown__item",
+        ".ant-select-item",
+        ".vxe-select--option",
+        ".el-option"
+    ]
+    
+    platforms = []
+    skip_regex = re.compile(skip_pattern) if skip_pattern else None
+    
+    # 尝试找到激活的下拉面板
+    panel_found = False
+    for ps in panel_selectors:
+        try:
+            panels = pg.locator(ps)
+            panel_count = await panels.count()
+            
+            if panel_count > 0:
+                # 取最后一个可见面板（通常是最新打开的）
+                panel = panels.last
+                print(f"[DISCOVER] 找到下拉面板：{ps}")
+                
+                # 在面板内查找所有选项
+                for opt_sel in option_selectors:
+                    try:
+                        options = panel.locator(opt_sel)
+                        count = await options.count()
+                        
+                        if count > 0:
+                            print(f"[DISCOVER] 找到 {count} 个候选平台选项")
+                            panel_found = True
+                            
+                            for i in range(count):
+                                # 跳过指定索引
+                                if i in skip_indices:
+                                    print(f"[DISCOVER] ⏭️  跳过索引 {i}（配置跳过）")
+                                    continue
+                                
+                                try:
+                                    option = options.nth(i)
+                                    
+                                    # 检查是否被禁用
+                                    is_disabled = False
+                                    try:
+                                        classes = await option.get_attribute("class") or ""
+                                        aria_disabled = await option.get_attribute("aria-disabled") or ""
+                                        if "disabled" in classes.lower() or aria_disabled == "true":
+                                            is_disabled = True
+                                    except Exception:
+                                        pass
+                                    
+                                    if is_disabled:
+                                        print(f"[DISCOVER] ⏭️  跳过索引 {i}（已禁用）")
+                                        continue
+                                    
+                                    # 读取选项文本
+                                    text = await option.inner_text()
+                                    text = re.sub(r"\s+", " ", text.strip())
+                                    
+                                    # 过滤空选项
+                                    if not text:
+                                        continue
+                                    
+                                    # 过滤常见的非平台选项
+                                    if text in {"请选择", "请选择平台", "Select", "Please select", "—", "-", "..."}:
+                                        print(f"[DISCOVER] ⏭️  跳过索引 {i}：'{text}'（通用提示）")
+                                        continue
+                                    
+                                    # 应用正则过滤
+                                    if skip_regex and skip_regex.search(text):
+                                        print(f"[DISCOVER] ⏭️  跳过索引 {i}：'{text}'（匹配过滤规则）")
+                                        continue
+                                    
+                                    # 去重
+                                    if text not in platforms:
+                                        platforms.append(text)
+                                        print(f"[DISCOVER] ✅ 索引 {i}: {text}")
+                                    else:
+                                        print(f"[DISCOVER] ⏭️  跳过索引 {i}：'{text}'（重复）")
+                                        
+                                except Exception as e:
+                                    print(f"[WARN] 读取选项 {i} 失败: {e}")
+                                    continue
+                            
+                            # 找到选项后跳出
+                            if platforms:
+                                break
+                                
+                    except Exception as e:
+                        print(f"[DEBUG] 选择器 {opt_sel} 失败: {e}")
+                        continue
+                
+                if panel_found:
+                    break
+                    
+        except Exception as e:
+            print(f"[DEBUG] 面板选择器 {ps} 失败: {e}")
+            continue
+    
+    # 3. 关闭下拉框（按ESC键）
+    try:
+        await pg.keyboard.press("Escape")
+        await asyncio.sleep(0.3)
+    except Exception:
+        pass
+    
+    if platforms:
+        print(f"[DISCOVER] ✅ 成功发现 {len(platforms)} 个有效平台")
+        for idx, plat in enumerate(platforms, 1):
+            print(f"[DISCOVER]   {idx}. {plat}")
+    else:
+        print(f"[WARN] 未能自动发现任何平台，可能需要检查页面结构")
+    
+    return platforms
+
 async def auto_select_platform_option(scope, target_text: str, shotdir: Path) -> bool:
     """
     自动在已打开的下拉列表中查找并点击目标平台选项。
@@ -1216,12 +1388,17 @@ async def _wait_download_or_toast(scope, timeout_ms: int = 8000):
 async def click_modal_confirm(modal, confirm_rx: re.Pattern, timeout_download=8000):
     """点击确认按钮，随后等待下载或无数据toast，谁先来用谁。"""
     pg = page_of(modal)
+    # 增强 VXE 面板按钮定位
     cands = [
-        modal.locator(".vxe-modal--footer button, .vxe-button"),
+        modal.locator(".vxe-modal--footer .vxe-button, .vxe-modal--footer button, .vxe-button"),
+        modal.locator(".vxe-export--panel .vxe-button, .vxe-export--panel button"),
         modal.locator(".el-message-box__btns button, .el-dialog__footer button, .el-button"),
-        modal.locator(".ant-modal-footer button"),
-        modal.locator("button, .el-button, .vxe-button")
+        modal.locator(".ant-modal-footer button, .ant-btn"),
+        modal.locator("button, .el-button, .vxe-button, .ant-btn")
     ]
+    # 扩展确认文本匹配
+    confirm_text_rx = re.compile(r"(导出|确定|下载|Export|OK|Confirm|CSV|Excel|开始导出|提交|确定导出|导出数据)", re.I)
+    
     # 先尝试匹配带确认语义的按钮
     for loc in cands:
         cnt = await loc.count()
@@ -1229,7 +1406,7 @@ async def click_modal_confirm(modal, confirm_rx: re.Pattern, timeout_download=80
             try:
                 b = loc.nth(i)
                 txt = (await b.inner_text()).strip()
-                if confirm_rx.search(txt):
+                if confirm_text_rx.search(txt) or confirm_rx.search(txt):
                     await b.click()
                     kind, val = await _wait_download_or_toast(modal, timeout_ms=timeout_download)
                     if kind == "download":
@@ -1267,6 +1444,21 @@ async def click_modal_confirm(modal, confirm_rx: re.Pattern, timeout_download=80
             with contextlib.suppress(Exception):
                 await _close_modal_without_download(modal)
         return None
+    
+    # 兜底：尝试按 Enter 提交
+    print("[INFO] 未找到确认按钮，尝试回车提交")
+    try:
+        await modal.focus()
+    except Exception:
+        pass
+    try:
+        kind, val = await _wait_download_or_toast(modal, timeout_ms=timeout_download)
+        await pg.keyboard.press("Enter")
+        if kind == "download":
+            return val
+    except Exception:
+        pass
+    
     return None
 
 async def click_export_and_download(scope, export_rx: re.Pattern, confirm_rx: re.Pattern, target_path: Path, shotdir: Path, timeout_modal: int = 8000, timeout_no_modal: int = 6000) -> bool:
@@ -1277,6 +1469,47 @@ async def click_export_and_download(scope, export_rx: re.Pattern, confirm_rx: re
         timeout_no_modal: 无弹窗时的下载超时时间（毫秒），默认6秒
     """
     pg = page_of(scope)
+    
+    # 等待页面空闲：遮罩/动画彻底消失，避免点击被拦截
+    print("[INFO] 等待页面加载完成...")
+    async def wait_idle(max_ms=15000):
+        sels = [
+            ".vxe-grid.is--loading",
+            ".vxe-grid.is--animat.is--loading",
+            ".el-loading-mask",
+            ".vxe-modal--wrapper.lock--view.is--mask",
+        ]
+        try:
+            with contextlib.suppress(Exception):
+                await pg.wait_for_timeout(150)
+            start = await pg.evaluate("Date.now()")
+            while True:
+                busy = False
+                for s in sels:
+                    try:
+                        loc = pg.locator(s)
+                        if await loc.count():
+                            with contextlib.suppress(Exception):
+                                if await loc.first.is_visible():
+                                    busy = True
+                                    break
+                    except Exception:
+                        pass
+                if not busy:
+                    with contextlib.suppress(Exception):
+                        await pg.wait_for_timeout(120)
+                    return
+                now = await pg.evaluate("Date.now()")
+                if (now - start) > max_ms:
+                    print("[WARN] 等待loading遮罩超时，继续尝试点击")
+                    return
+                with contextlib.suppress(Exception):
+                    await pg.wait_for_timeout(120)
+        except Exception:
+            pass
+    
+    await wait_idle(15000)
+    
     btns = scope.get_by_role("button", name=export_rx)
     if not await btns.count():
         btns = scope.locator("button, .el-button, .vxe-button").filter(has_text=export_rx)
@@ -1288,8 +1521,16 @@ async def click_export_and_download(scope, export_rx: re.Pattern, confirm_rx: re
     try:
         await btns.first.scroll_into_view_if_needed()
         await btns.first.click()
-    except Exception:
-        with contextlib.suppress(Exception): await btns.first.click(force=True)
+    except Exception as e:
+        # 若日志含有拦截字样，再等待空闲重试一次
+        if "intercepts pointer events" in f"{e}":
+            print("[INFO] 发现点击被遮罩拦截，二次等待空闲后重试点击")
+            await wait_idle(8000)
+            with contextlib.suppress(Exception):
+                await btns.first.click()
+        else:
+            with contextlib.suppress(Exception):
+                await btns.first.click(force=True)
     
     # 导出按钮点击后，部分系统会立即以"toast"方式提示"暂无导出数据"且弹窗仍保持"导出数据"表单
     # 在对话框确认前再快速检查一次全局无数据提示，避免进入长时间的下载等待
@@ -1373,7 +1614,8 @@ async def click_export_and_download(scope, export_rx: re.Pattern, confirm_rx: re
 
 # ---------- Run ----------
 async def run(args):
-    cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+    cfg_path = Path(args.config)
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     base = cfg["base_origin"].rstrip("/")
     shotdir = Path("_shots"); shotdir.mkdir(exist_ok=True)
 
@@ -1387,6 +1629,20 @@ async def run(args):
     plat_idx = cfg.get("selectors",{}).get("platform_select_index", 0)
     frame_selector = cfg.get("frame_selector","")
     login_once = {"done": False}
+    # --- Config diagnostics ---
+    try:
+        print(f"[CFG] 使用配置文件: {cfg_path}")
+        print(f"[CFG] base_origin: {base}")
+        print(f"[CFG] platform_select_index: {plat_idx}")
+        mm = cfg.get("menu_modes", {})
+        print(f"[CFG] menu_modes.manual_platform: ops={mm.get('ops',{}).get('manual_platform')}, first_login_return={mm.get('first_login_return',{}).get('manual_platform')}, first_recharge_return={mm.get('first_recharge_return',{}).get('manual_platform')}, first_recharge_recharge={mm.get('first_recharge_recharge',{}).get('manual_platform')}, ltv={mm.get('ltv',{}).get('manual_platform')}, promotion={mm.get('promotion',{}).get('manual_platform')}, gift_type={mm.get('gift_type',{}).get('manual_platform')}, daily_channel={mm.get('daily_channel',{}).get('manual_platform')}")
+        print(f"[CFG] manual_platform_targets: {len(manual_targets)} 个")
+        if manual_targets:
+            preview = manual_targets[:5]
+            print(f"[CFG] targets 预览: {preview}{' ...' if len(manual_targets)>5 else ''}")
+        print(f"[CFG] auto_discover_platforms={cfg.get('auto_discover_platforms', False)}, skip_platform_indices={cfg.get('skip_platform_indices', [])}, skip_platform_pattern={cfg.get('skip_platform_pattern')}")
+    except Exception:
+        pass
     
     # 获取盘口名称，用于文件命名（增强：如果配置缺失，从域名自动提取）
     from urllib.parse import urlparse
@@ -1425,9 +1681,87 @@ async def run(args):
     timeout_no_modal = timeouts.get("download_no_modal", 6000)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=args.headless)
-        ctx: BrowserContext = await browser.new_context(accept_downloads=True)
-        page: Page = await ctx.new_page()
+        # 使用持久化浏览器上下文，最接近真实浏览器
+        user_data_dir = Path("./browser_profile")
+        user_data_dir.mkdir(exist_ok=True)
+        
+        # 精简启动参数，避免触发检测
+        launch_args = [
+            '--disable-blink-features=AutomationControlled',
+        ]
+        
+        # 尝试使用系统 Chrome 启动持久化上下文
+        try:
+            print("[INFO] 启动持久化浏览器会话（使用系统 Chrome）...")
+            ctx: BrowserContext = await pw.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                headless=args.headless,
+                channel='chrome',  # 使用系统 Chrome
+                args=launch_args,
+                viewport={'width': 1920, 'height': 1080},
+                locale='zh-CN',
+                timezone_id='Asia/Shanghai',
+                # 使用真实的 Chrome 141 User Agent
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+                accept_downloads=True,
+                # 添加权限，避免弹窗
+                permissions=['geolocation', 'notifications'],
+            )
+            print("[INFO] ✅ 使用持久化浏览器（会自动保存登录状态、cookies）")
+        except Exception as e:
+            print(f"[WARN] 系统 Chrome 不可用，使用 Chromium: {e}")
+            ctx: BrowserContext = await pw.chromium.launch_persistent_context(
+                user_data_dir=str(user_data_dir),
+                headless=args.headless,
+                args=launch_args,
+                viewport={'width': 1920, 'height': 1080},
+                locale='zh-CN',
+                timezone_id='Asia/Shanghai',
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+                accept_downloads=True,
+            )
+        
+        # 注入反检测脚本
+        await ctx.add_init_script("""
+            // 移除 webdriver 标志
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            
+            // 添加真实的 chrome 对象
+            window.navigator.chrome = {
+                runtime: {},
+                loadTimes: function() {},
+                csi: function() {},
+                app: {},
+            };
+            
+            // 真实的 plugins
+            Object.defineProperty(navigator, 'plugins', {
+                get: () => [1, 2, 3, 4, 5],
+            });
+            
+            // 语言设置
+            Object.defineProperty(navigator, 'languages', {
+                get: () => ['zh-CN', 'zh', 'en-US', 'en'],
+            });
+            
+            // 模拟真实的权限查询
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        """)
+        
+        # 获取或创建页面
+        if len(ctx.pages) > 0:
+            page: Page = ctx.pages[0]
+            print("[INFO] 使用已存在的浏览器标签页")
+        else:
+            page: Page = await ctx.new_page()
+            print("[INFO] 创建新的浏览器标签页")
         try:
             # 强化初始导航的鲁棒性与超时
             with contextlib.suppress(Exception):
@@ -1448,7 +1782,14 @@ async def run(args):
                     if nav_try == nav_attempts - 1:
                         raise
                     await asyncio.sleep(3)
-            await wait_login_pause(page, shotdir, once_flag=login_once)
+            # 检查是否需要登录（持久化浏览器会自动保存登录状态）
+            skip_pause = getattr(args, "skip_login_pause", False)
+            if not skip_pause:
+                await wait_login_pause(page, shotdir, once_flag=login_once)
+                print("[INFO] 登录完成，继续执行任务")
+                print("[INFO] 登录状态已自动保存到浏览器配置文件中")
+            else:
+                print("[INFO] 跳过登录暂停检测")
             scope = get_scope(page, frame_selector)
 
             async def before_each_task(menu_key: str) -> bool:
@@ -1572,8 +1913,35 @@ async def run(args):
                 """处理留存率数据 - 需要分渠道处理"""
                 if not await before_each_task(key): return
                 print(f"[INFO] Start {key} data crawling (channel processing)")
-                
-                for target in manual_targets:
+                # ===== 智能自动发现平台（留存任务） =====
+                auto_discover = cfg.get("auto_discover_platforms", False)
+                skip_platform_indices = cfg.get("skip_platform_indices", [])
+                skip_platform_pattern = cfg.get("skip_platform_pattern", None)
+
+                if auto_discover:
+                    print(f"[INFO] {key}：🔍 自动发现所有平台")
+                    discovered_platforms = await discover_all_platforms(
+                        scope,
+                        plat_idx,
+                        skip_platform_indices,
+                        skip_platform_pattern
+                    )
+                    if discovered_platforms:
+                        targets = discovered_platforms
+                        print(f"[INFO] 将处理 {len(targets)} 个自动发现的平台")
+                    else:
+                        print("[WARN] 自动发现失败，使用配置的平台列表")
+                        targets = manual_targets
+                else:
+                    targets = manual_targets
+                    print(f"[INFO] 使用手动配置的 {len(targets)} 个平台")
+                try:
+                    print(f"[RUN] {key} 本次目标平台数: {len(targets)}")
+                except Exception:
+                    pass
+                # ===== 自动发现结束 =====
+
+                for target in targets:
                     if target in skip_targets:
                         print(f"[SKIP] Skip platform by rule: {target}")
                         continue
@@ -1772,25 +2140,256 @@ async def run(args):
                     await do_month_exports(f"download_{key}_{plat_name}")
 
             async def task_promotion():
-                """推广渠道统计 - 查询一次，导出三次，不需要分渠道爬取"""
+                """推广渠道统计 - 按平台逐一导出（若配置为手动平台模式）"""
                 if not await before_each_task("promotion"): return
-                print("[INFO] 推广渠道统计：查询一次，导出三次")
-                # 使用原有的导出逻辑，保持原有文件名格式
-                await do_yesterday_exports_multi("promotion_buttons", "推广")
+                mode = menu_modes.get("promotion", {"manual_platform": False})
+                if not mode.get("manual_platform", False):
+                    print("[INFO] 推广渠道统计：查询一次，导出三次（全平台）")
+                    await do_yesterday_exports_multi("promotion_buttons", "推广")
+                    return
+
+                # ===== 智能自动发现平台 =====
+                auto_discover = cfg.get("auto_discover_platforms", False)
+                skip_platform_indices = cfg.get("skip_platform_indices", [])
+                skip_platform_pattern = cfg.get("skip_platform_pattern", None)
+                
+                if auto_discover:
+                    print("[INFO] 推广渠道统计：🔍 自动发现所有平台")
+                    discovered_platforms = await discover_all_platforms(
+                        scope, 
+                        plat_idx, 
+                        skip_platform_indices, 
+                        skip_platform_pattern
+                    )
+                    if discovered_platforms:
+                        targets = discovered_platforms
+                        print(f"[INFO] 将处理 {len(targets)} 个自动发现的平台")
+                    else:
+                        print("[WARN] 自动发现失败，使用配置的平台列表")
+                        targets = manual_targets
+                else:
+                    targets = manual_targets
+                    print(f"[INFO] 使用手动配置的 {len(targets)} 个平台")
+                # ===== 自动发现结束 =====
+                try:
+                    print(f"[RUN] promotion 本次目标平台数: {len(targets)}")
+                except Exception:
+                    pass
+
+                print("[INFO] 推广渠道统计：按平台逐一导出")
+                per_task_indices = cfg.get("per_task_platform_indices", {}).get("promotion", [])
+                candidate_indices = []
+                if isinstance(per_task_indices, list): candidate_indices.extend(per_task_indices)
+                candidate_indices.extend([plat_idx, 0, 1, 2])
+                # 去重保序
+                seen = set(); candidate_indices = [i for i in candidate_indices if (i not in seen and not seen.add(i))]
+
+                def _extract_id(txt: Optional[str]) -> Optional[str]:
+                    if not txt: return None
+                    m = re.match(r"(\d+)\s*\|", txt)
+                    return m.group(1) if m else None
+
+                def _match_target(selected: Optional[str], target_text: str) -> bool:
+                    if not selected: return False
+                    s = re.sub(r"\s+", " ", selected.strip())
+                    if target_text in s or s in target_text: return True
+                    sid = _extract_id(s); tid = _extract_id(target_text)
+                    return bool(sid and tid and sid == tid)
+
+                for target in targets:
+                    if target in skip_targets:
+                        print(f"[SKIP] 跳过平台：{target}")
+                        continue
+
+                    plat_name = None
+                    for try_idx in candidate_indices:
+                        print(f"[SELECT] 尝试索引 {try_idx} 选择平台：{target}")
+                        sel = await wait_for_user_platform(scope, try_idx, target, timeout_ms=180000, auto_mode=auto_mode, clear_before_select=True)
+                        if _match_target(sel, target):
+                            plat_name = sel
+                            print(f"[OK] 平台选择成功（索引 {try_idx}）：{plat_name}")
+                            break
+                        else:
+                            if sel:
+                                print(f"[WARN] 平台选择未匹配（索引 {try_idx}）：实际={sel} 期望包含/同ID={target}")
+                            else:
+                                print(f"[WARN] 索引 {try_idx} 未读到已选平台，继续尝试...")
+                            await asyncio.sleep(0.4)
+
+                    if not plat_name:
+                        print(f"[SKIP] 未能选择平台：{target}")
+                        continue
+
+                    # 按平台导出三项（昨天）
+                    tag_prefix = f"推广_{plat_name}"
+                    await do_yesterday_exports_multi("promotion_buttons", tag_prefix)
 
             async def task_gift():
-                """赠送类型统计 - 默认全平台，选择一次即可"""
+                """赠送类型统计 - 最近15天，按平台逐一导出（若配置为手动平台模式）"""
                 if not await before_each_task("gift_type"): return
-                print("[INFO] 赠送类型统计：最近15天，逐日导出")
-                # 按需逐日导出最近15天
-                await do_last_n_days_exports_multi("gift_type_buttons", "赠送类型统计", days=15)
+                mode = menu_modes.get("gift_type", {"manual_platform": False})
+                if not mode.get("manual_platform", False):
+                    print("[INFO] 赠送类型统计：最近15天（全平台）")
+                    await do_last_n_days_exports_multi("gift_type_buttons", "赠送类型统计", days=15)
+                    return
+
+                # ===== 智能自动发现平台 =====
+                auto_discover = cfg.get("auto_discover_platforms", False)
+                skip_platform_indices = cfg.get("skip_platform_indices", [])
+                skip_platform_pattern = cfg.get("skip_platform_pattern", None)
+                
+                if auto_discover:
+                    print("[INFO] 赠送类型统计：🔍 自动发现所有平台")
+                    discovered_platforms = await discover_all_platforms(
+                        scope, 
+                        plat_idx, 
+                        skip_platform_indices, 
+                        skip_platform_pattern
+                    )
+                    if discovered_platforms:
+                        targets = discovered_platforms
+                        print(f"[INFO] 将处理 {len(targets)} 个自动发现的平台")
+                    else:
+                        print("[WARN] 自动发现失败，使用配置的平台列表")
+                        targets = manual_targets
+                else:
+                    targets = manual_targets
+                    print(f"[INFO] 使用手动配置的 {len(targets)} 个平台")
+                # ===== 自动发现结束 =====
+                try:
+                    print(f"[RUN] gift_type 本次目标平台数: {len(targets)}")
+                except Exception:
+                    pass
+
+                print("[INFO] 赠送类型统计：按平台逐日导出最近15天")
+                per_task_indices = cfg.get("per_task_platform_indices", {}).get("gift_type", [])
+                candidate_indices = []
+                if isinstance(per_task_indices, list): candidate_indices.extend(per_task_indices)
+                candidate_indices.extend([plat_idx, 0, 1, 2])
+                seen = set(); candidate_indices = [i for i in candidate_indices if (i not in seen and not seen.add(i))]
+
+                def _extract_id(txt: Optional[str]) -> Optional[str]:
+                    if not txt: return None
+                    m = re.match(r"(\d+)\s*\|", txt)
+                    return m.group(1) if m else None
+
+                def _match_target(selected: Optional[str], target_text: str) -> bool:
+                    if not selected: return False
+                    s = re.sub(r"\s+", " ", selected.strip())
+                    if target_text in s or s in target_text: return True
+                    sid = _extract_id(s); tid = _extract_id(target_text)
+                    return bool(sid and tid and sid == tid)
+
+                for target in targets:
+                    if target in skip_targets:
+                        print(f"[SKIP] 跳过平台：{target}")
+                        continue
+
+                    plat_name = None
+                    for try_idx in candidate_indices:
+                        print(f"[SELECT] 尝试索引 {try_idx} 选择平台：{target}")
+                        sel = await wait_for_user_platform(scope, try_idx, target, timeout_ms=180000, auto_mode=auto_mode, clear_before_select=True)
+                        if _match_target(sel, target):
+                            plat_name = sel
+                            print(f"[OK] 平台选择成功（索引 {try_idx}）：{plat_name}")
+                            break
+                        else:
+                            if sel:
+                                print(f"[WARN] 平台选择未匹配（索引 {try_idx}）：实际={sel} 期望包含/同ID={target}")
+                            else:
+                                print(f"[WARN] 索引 {try_idx} 未读到已选平台，继续尝试...")
+                            await asyncio.sleep(0.4)
+
+                    if not plat_name:
+                        print(f"[SKIP] 未能选择平台：{target}")
+                        continue
+
+                    # 按平台逐日导出最近15天
+                    tag_prefix = f"赠送类型统计_{plat_name}"
+                    await do_last_n_days_exports_multi("gift_type_buttons", tag_prefix, days=15)
 
             async def task_daily_channel():
-                """每日渠道统计 - 全平台，不分渠道"""
+                """每日渠道统计 - 按平台逐一导出（若配置为手动平台模式）"""
                 if not await before_each_task("daily_channel"): return
-                print("[INFO] 每日渠道统计：全平台，不分渠道")
-                # 使用原有的导出逻辑，保持原有文件名格式
-                await do_yesterday_exports_multi("daily_channel_buttons", "每日渠道")
+                mode = menu_modes.get("daily_channel", {"manual_platform": False})
+                if not mode.get("manual_platform", False):
+                    print("[INFO] 每日渠道统计：昨天（全平台）")
+                    await do_yesterday_exports_multi("daily_channel_buttons", "每日渠道")
+                    return
+
+                # ===== 智能自动发现平台 =====
+                auto_discover = cfg.get("auto_discover_platforms", False)
+                skip_platform_indices = cfg.get("skip_platform_indices", [])
+                skip_platform_pattern = cfg.get("skip_platform_pattern", None)
+                
+                if auto_discover:
+                    print("[INFO] 每日渠道统计：🔍 自动发现所有平台")
+                    discovered_platforms = await discover_all_platforms(
+                        scope, 
+                        plat_idx, 
+                        skip_platform_indices, 
+                        skip_platform_pattern
+                    )
+                    if discovered_platforms:
+                        targets = discovered_platforms
+                        print(f"[INFO] 将处理 {len(targets)} 个自动发现的平台")
+                    else:
+                        print("[WARN] 自动发现失败，使用配置的平台列表")
+                        targets = manual_targets
+                else:
+                    targets = manual_targets
+                    print(f"[INFO] 使用手动配置的 {len(targets)} 个平台")
+                # ===== 自动发现结束 =====
+                try:
+                    print(f"[RUN] daily_channel 本次目标平台数: {len(targets)}")
+                except Exception:
+                    pass
+
+                print("[INFO] 每日渠道统计：按平台逐一导出昨天数据")
+                per_task_indices = cfg.get("per_task_platform_indices", {}).get("daily_channel", [])
+                candidate_indices = []
+                if isinstance(per_task_indices, list): candidate_indices.extend(per_task_indices)
+                candidate_indices.extend([plat_idx, 0, 1, 2])
+                seen = set(); candidate_indices = [i for i in candidate_indices if (i not in seen and not seen.add(i))]
+
+                def _extract_id(txt: Optional[str]) -> Optional[str]:
+                    if not txt: return None
+                    m = re.match(r"(\d+)\s*\|", txt)
+                    return m.group(1) if m else None
+
+                def _match_target(selected: Optional[str], target_text: str) -> bool:
+                    if not selected: return False
+                    s = re.sub(r"\s+", " ", selected.strip())
+                    if target_text in s or s in target_text: return True
+                    sid = _extract_id(s); tid = _extract_id(target_text)
+                    return bool(sid and tid and sid == tid)
+
+                for target in targets:
+                    if target in skip_targets:
+                        print(f"[SKIP] 跳过平台：{target}")
+                        continue
+
+                    plat_name = None
+                    for try_idx in candidate_indices:
+                        print(f"[SELECT] 尝试索引 {try_idx} 选择平台：{target}")
+                        sel = await wait_for_user_platform(scope, try_idx, target, timeout_ms=180000, auto_mode=auto_mode, clear_before_select=True)
+                        if _match_target(sel, target):
+                            plat_name = sel
+                            print(f"[OK] 平台选择成功（索引 {try_idx}）：{plat_name}")
+                            break
+                        else:
+                            if sel:
+                                print(f"[WARN] 平台选择未匹配（索引 {try_idx}）：实际={sel} 期望包含/同ID={target}")
+                            else:
+                                print(f"[WARN] 索引 {try_idx} 未读到已选平台，继续尝试...")
+                            await asyncio.sleep(0.4)
+
+                    if not plat_name:
+                        print(f"[SKIP] 未能选择平台：{target}")
+                        continue
+
+                    tag_prefix = f"每日渠道_{plat_name}"
+                    await do_yesterday_exports_multi("daily_channel_buttons", tag_prefix)
 
             # schedule - 按固定顺序执行，从运营统计开始
             requested_tasks = [x.strip() for x in args.tasks.split(",") if x.strip()]
@@ -1835,10 +2434,10 @@ async def run(args):
         finally:
             keep_browser = getattr(args, 'keep_browser', False)
             if not keep_browser:
+                # 持久化上下文只需关闭 ctx
                 with contextlib.suppress(Exception):
                     await ctx.close()
-                with contextlib.suppress(Exception):
-                    await browser.close()
+                print("[INFO] 浏览器已关闭，登录状态已保存")
             else:
                 print("[HOLD] 已开启 --keep-browser，浏览器保持打开状态，可手动观察或关闭。")
 
@@ -1849,6 +2448,8 @@ def main():
     p.add_argument("--headless", action="store_true", help="无头运行")
     p.add_argument("--manual", action="store_true", help="手动模式：需要手动选择平台（默认为自动模式）")
     p.add_argument("--keep-browser", action="store_true", help="任务完成后保持浏览器打开（用于调试观察）")
+    p.add_argument("--storage-state", default="", help="Playwright storage state json 文件路径（复用登录态）")
+    p.add_argument("--skip-login-pause", action="store_true", help="检测到登录页也不暂停（用于已登录或无需手动登录的场景）")
     args = p.parse_args()
     asyncio.run(run(args))
 
